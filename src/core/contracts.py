@@ -41,6 +41,58 @@ class Observation:
 
 
 @dataclass(frozen=True, slots=True)
+class ObserverResult:
+    """Observer output containing timestamped observations.
+
+    This contract exists so aggregation can consume results from any observer
+    without depending on observer implementations or feature-specific payloads.
+
+    Attributes:
+        observer: Observer family or implementation name that produced the
+            result.
+        observations: Timestamped observations emitted by the observer.
+        metadata: Additional observer-specific run metadata.
+    """
+
+    observer: str
+    observations: list[Observation] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineGroup:
+    """Observations that share the same source-media timestamp.
+
+    Attributes:
+        timestamp_seconds: Shared timestamp for the grouped observations.
+        observations: Original observations at this timestamp.
+    """
+
+    timestamp_seconds: float
+    observations: list[Observation] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class AggregatedTimeline:
+    """Chronological aggregation of observer observations.
+
+    This contract preserves observations exactly as emitted by observers. It is
+    a structural grouping only, with no scoring, filtering, ranking, or AI
+    decision-making.
+
+    Attributes:
+        groups: Chronological groups of observations by timestamp.
+        observer_results: Original observer result objects included in the
+            aggregation.
+        metadata: Optional aggregation metadata.
+    """
+
+    groups: list[TimelineGroup] = field(default_factory=list)
+    observer_results: list[ObserverResult] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class DownloadResult:
     """Output contract produced by the downloader stage.
 
