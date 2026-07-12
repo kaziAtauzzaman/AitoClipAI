@@ -26,6 +26,12 @@ class CandidateScorer:
         )
         self._validate_config()
 
+    @property
+    def candidate_local_deterministic(self) -> bool:
+        """Declare that each score depends only on its candidate and configuration."""
+
+        return True
+
     def score(self, candidates: Iterable[ClipCandidate]) -> list[ClipScore]:
         """Return candidates sorted from highest to lowest overall score."""
 

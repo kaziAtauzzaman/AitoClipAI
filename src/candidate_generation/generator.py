@@ -27,6 +27,18 @@ class CandidateGenerator:
             default_heuristics(self._config) if heuristics is None else heuristics
         )
 
+    @property
+    def maximum_backtrack_seconds(self) -> float:
+        """Maximum distance a newly stable event can revise candidate history."""
+
+        return self._config.maximum_clip_seconds
+
+    @property
+    def incremental_deterministic(self) -> bool:
+        """Declare deterministic output for an identical stable timeline prefix."""
+
+        return True
+
     def generate(self, feature_timeline: FeatureTimeline) -> list[ClipCandidate]:
         """Generate candidate windows without modifying timeline observations."""
 

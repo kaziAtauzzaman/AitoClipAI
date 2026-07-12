@@ -17,6 +17,18 @@ from pipeline.errors import (
     RequiredObserverError,
 )
 from pipeline.orchestrator import MediaDownloader, PipelineConfig, PipelineOrchestrator
+from pipeline.incremental import (
+    candidate_fingerprint,
+    CompletedTimelineReplayAdapter,
+    CompletedTimelineReplayConfig,
+    CoordinatorLifecycle,
+    IncrementalEOF,
+    IncrementalPipelineConfig,
+    IncrementalPipelineResult,
+    IncrementalPrerecordedCoordinator,
+    ObserverWatermarks,
+    RenderLifecycleState,
+)
 from pipeline.persistence import JsonFeatureTimelineWriter, TimelineWriter
 from pipeline.prerecorded import PrerecordedPipelineConfig, PrerecordedVideoPipeline
 from pipeline.validation import (
@@ -32,9 +44,19 @@ __all__ = [
     "ArtifactValidationConfig",
     "ArtifactValidationError",
     "ArtifactValidator",
+    "candidate_fingerprint",
+    "CompletedTimelineReplayAdapter",
+    "CompletedTimelineReplayConfig",
+    "CoordinatorLifecycle",
     "FFprobeMediaProbe",
     "JsonFeatureTimelineWriter",
     "JsonValidationReportWriter",
+    "IncrementalPipelineConfig",
+    "IncrementalEOF",
+    "IncrementalPipelineResult",
+    "IncrementalPrerecordedCoordinator",
+    "ObserverWatermarks",
+    "RenderLifecycleState",
     "MediaProbe",
     "MediaProbeError",
     "MediaProbeResult",

@@ -93,6 +93,34 @@ class ClipRenderer:
             for rank, score in enumerate(ranked, start=1)
         ]
 
+    def render_one(
+        self,
+        score: ClipScore,
+        identity: int,
+        caption_artifact: CaptionArtifact | None = None,
+    ) -> RenderJob:
+        """Render one finalized score with an explicit monotonic identity.
+
+        This entry point intentionally bypasses ``maximum_clips`` and score
+        reranking.  It is used by chronological incremental coordinators after
+        selection has already finalized one winner.
+        """
+
+        if identity <= 0:
+            raise InvalidRenderInputError("Render identity must be positive.")
+        ffmpeg_path = self._executable_locator(self._config.ffmpeg_binary)
+        if ffmpeg_path is None:
+            raise RenderingFFmpegNotFoundError(
+                f"FFmpeg executable was not found: {self._config.ffmpeg_binary!r}."
+            )
+        try:
+            self._config.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ClipRenderingError(
+                f"Failed to create clip output directory: {exc}"
+            ) from exc
+        return self._render_score(ffmpeg_path, score, identity, caption_artifact)
+
     def _render_score(
         self,
         ffmpeg_path: str,
