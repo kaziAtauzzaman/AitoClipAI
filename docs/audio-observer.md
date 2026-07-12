@@ -11,6 +11,10 @@ The package separates responsibilities into focused services:
 - `AudioObserver` implements `observers.Observer` and coordinates the workflow.
 - `AudioExtractor` resolves an audio artifact from `ObserverContext`.
 - `ContextAudioExtractor` uses `ObserverContext.source_path` as the audio file.
+- `FFmpegAudioExtractor` converts context media into deterministic PCM WAV
+  audio through an injectable command runner.
+- `FFmpegAudioExtractorConfig` controls sample rate, channels, output location,
+  overwrite behavior, and the FFmpeg executable name.
 - `AudioLoader` loads normalized samples from an `AudioSource`.
 - `WavAudioLoader` loads PCM WAV files using only the Python standard library.
 - `TimestampGenerator` creates deterministic analysis windows.
@@ -50,6 +54,9 @@ Use dependency injection to replace infrastructure without changing
 
 - Replace `AudioExtractor` to extract audio from video, remote media, or cached
   artifacts.
+- Use `FFmpegAudioExtractor` for downloaded video or media paths. It validates
+  FFmpeg availability and emits `FFmpegNotFoundError` or
+  `AudioExtractionError` for expected infrastructure failures.
 - Replace `AudioLoader` to support non-WAV formats or external decoders.
 - Replace `AudioAnalyzer` or its focused services to use more advanced DSP or
   ML models.

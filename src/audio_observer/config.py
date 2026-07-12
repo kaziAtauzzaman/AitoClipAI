@@ -1,6 +1,21 @@
-"""Configurable audio observer thresholds."""
+"""Runtime configuration for audio extraction and observation."""
 
 from dataclasses import dataclass
+from pathlib import Path
+
+
+DEFAULT_EXTRACTED_AUDIO_DIR = Path("data") / "audio"
+
+
+@dataclass(frozen=True, slots=True)
+class FFmpegAudioExtractorConfig:
+    """Runtime configuration for deterministic FFmpeg audio extraction."""
+
+    sample_rate_hz: int = 16_000
+    channels: int = 1
+    output_dir: Path = DEFAULT_EXTRACTED_AUDIO_DIR
+    overwrite_existing: bool = False
+    ffmpeg_binary: str = "ffmpeg"
 
 
 @dataclass(frozen=True, slots=True)

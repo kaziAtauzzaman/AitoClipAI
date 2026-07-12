@@ -39,6 +39,7 @@ data/downloads/*
 data/clips/*
 data/captions/*
 data/logs/*
+data/audio/*
 models/*
 
 # Preserve documented placeholder files
@@ -46,4 +47,5 @@ models/*
 !data/clips/README.md
 !data/captions/README.md
 !data/logs/README.md
+!data/audio/README.md
 !models/README.md
