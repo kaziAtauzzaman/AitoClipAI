@@ -98,6 +98,27 @@ class FakeTelemetryHook:
         self.events.append(f"error:{observer_name}:{failure.error_type}")
 
 
+class FailingTelemetryHook:
+    def before_observer(self, observer_name: str, context: ObserverContext) -> None:
+        raise RuntimeError("before telemetry failed")
+
+    def after_observer(
+        self,
+        observer_name: str,
+        context: ObserverContext,
+        result: ObserverResult,
+    ) -> None:
+        raise RuntimeError("after telemetry failed")
+
+    def on_observer_error(
+        self,
+        observer_name: str,
+        context: ObserverContext,
+        failure: ObserverExecutionFailure,
+    ) -> None:
+        raise RuntimeError("error telemetry failed")
+
+
 def test_observer_engine_executes_successful_observers() -> None:
     registry = ObserverRegistry(
         observers=[
@@ -190,6 +211,20 @@ def test_observer_engine_isolates_invalid_observation_items() -> None:
     assert result.failures[0].error_type == "InvalidObserverOutputError"
 
 
+def test_observer_engine_rejects_result_for_different_observer() -> None:
+    mismatched_result = ObserverResult(observer="different")
+    registry = ObserverRegistry(
+        observers=[FakeObserver("registered", output=mismatched_result)]
+    )
+
+    result = ObserverEngine(registry).run(ObserverContext())
+
+    assert result.results == []
+    assert len(result.failures) == 1
+    assert result.failures[0].error_type == "InvalidObserverOutputError"
+    assert "different" in result.failures[0].message
+
+
 def test_observer_registry_discovers_provider_observers() -> None:
     registry = ObserverRegistry(
         providers=[FakeProvider([FakeObserver("provided", order=1)])]
@@ -222,3 +257,55 @@ def test_observer_telemetry_receives_failures() -> None:
 
     assert len(result.failures) == 1
     assert telemetry.events == ["before:bad", "error:bad:RuntimeError"]
+
+
+def test_observer_teardown_runs_after_observe_failure() -> None:
+    calls: list[str] = []
+    observer = FakeObserver("bad", should_fail=True, calls=calls)
+
+    result = ObserverEngine(ObserverRegistry(observers=[observer])).run(
+        ObserverContext()
+    )
+
+    assert len(result.failures) == 1
+    assert calls == ["bad:setup", "bad:observe", "bad:teardown"]
+
+
+def test_observer_teardown_runs_after_validation_failure() -> None:
+    calls: list[str] = []
+    observer = FakeObserver("invalid", output={"invalid": True}, calls=calls)
+
+    result = ObserverEngine(ObserverRegistry(observers=[observer])).run(
+        ObserverContext()
+    )
+
+    assert len(result.failures) == 1
+    assert calls == ["invalid:setup", "invalid:observe", "invalid:teardown"]
+
+
+def test_telemetry_failures_do_not_change_successful_execution() -> None:
+    registry = ObserverRegistry(observers=[FakeObserver("good")])
+
+    result = ObserverEngine(
+        registry, telemetry_hook=FailingTelemetryHook()
+    ).run(ObserverContext())
+
+    assert [item.observer for item in result.results] == ["good"]
+    assert result.failures == []
+
+
+def test_error_telemetry_failure_does_not_stop_remaining_observers() -> None:
+    registry = ObserverRegistry(
+        observers=[
+            FakeObserver("bad", order=10, should_fail=True),
+            FakeObserver("good", order=20),
+        ]
+    )
+
+    result = ObserverEngine(
+        registry, telemetry_hook=FailingTelemetryHook()
+    ).run(ObserverContext())
+
+    assert [item.observer for item in result.results] == ["good"]
+    assert len(result.failures) == 1
+    assert result.failures[0].observer == "bad"

@@ -21,6 +21,12 @@ class ObserverResultValidator:
                 f"{observer_name} returned an ObserverResult with no observer name."
             )
 
+        if result.observer != observer_name:
+            raise InvalidObserverOutputError(
+                f"{observer_name} returned an ObserverResult for "
+                f"{result.observer!r}."
+            )
+
         if not isinstance(result.observations, list):
             raise InvalidObserverOutputError(
                 f"{observer_name} returned observations that are not a list."

@@ -1,9 +1,9 @@
 """Download orchestration for source videos."""
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from core import DownloadResult
 from downloader.config import DownloaderConfig
 from downloader.errors import DownloadError
 from downloader.metadata import MetadataWriter, VideoMetadata
@@ -15,21 +15,6 @@ class DownloadClient(Protocol):
 
     def extract_info(self, url: str, *, download: bool) -> dict[str, Any]:
         """Download media when requested and return raw metadata."""
-
-
-@dataclass(frozen=True, slots=True)
-class DownloadResult:
-    """Result returned after a successful source video download.
-
-    Attributes:
-        video_path: Path to the downloaded video file.
-        metadata_path: Path to the JSON metadata file beside the video.
-        metadata: Normalized metadata for the downloaded video.
-    """
-
-    video_path: Path
-    metadata_path: Path
-    metadata: VideoMetadata
 
 
 class VideoDownloader:
@@ -75,9 +60,16 @@ class VideoDownloader:
             raise DownloadError(f"Failed to write metadata JSON: {exc}") from exc
 
         return DownloadResult(
+            source_url=url,
             video_path=video_path,
             metadata_path=metadata_path,
-            metadata=metadata,
+            provider=metadata.extractor,
+            media_id=metadata.id,
+            title=metadata.title,
+            duration_seconds=(
+                float(metadata.duration) if metadata.duration is not None else None
+            ),
+            metadata=metadata.to_dict(),
         )
 
     def _resolve_downloaded_path(self, info: dict[str, Any]) -> Path:

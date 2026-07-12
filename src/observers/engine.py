@@ -60,11 +60,34 @@ class ObserverEngine:
     ) -> tuple[ObserverResult | None, ObserverExecutionFailure | None]:
         observer_name = observer.name
         self._logger.debug("Starting observer %s", observer_name)
-        self._telemetry_hook.before_observer(observer_name, context)
+        self._notify_telemetry("before_observer", observer_name, context)
 
+        setup_completed = False
         try:
             observer.setup(context)
+            setup_completed = True
             result = self._validator.validate(observer_name, observer.observe(context))
+        except Exception as exc:
+            if setup_completed:
+                try:
+                    observer.teardown(context)
+                except Exception:
+                    self._logger.exception(
+                        "Observer %s teardown failed after an earlier failure",
+                        observer_name,
+                    )
+            failure = ObserverExecutionFailure(
+                observer=observer_name,
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+            self._logger.exception("Observer %s failed", observer_name)
+            self._notify_telemetry(
+                "on_observer_error", observer_name, context, failure
+            )
+            return None, failure
+
+        try:
             observer.teardown(context)
         except Exception as exc:
             failure = ObserverExecutionFailure(
@@ -72,10 +95,23 @@ class ObserverEngine:
                 error_type=type(exc).__name__,
                 message=str(exc),
             )
-            self._logger.exception("Observer %s failed", observer_name)
-            self._telemetry_hook.on_observer_error(observer_name, context, failure)
+            self._logger.exception("Observer %s teardown failed", observer_name)
+            self._notify_telemetry(
+                "on_observer_error", observer_name, context, failure
+            )
             return None, failure
 
         self._logger.debug("Finished observer %s", observer_name)
-        self._telemetry_hook.after_observer(observer_name, context, result)
+        self._notify_telemetry(
+            "after_observer", observer_name, context, result
+        )
         return result, None
+
+    def _notify_telemetry(self, method_name: str, *args: object) -> None:
+        """Call a telemetry hook without allowing it to affect execution."""
+
+        try:
+            method = getattr(self._telemetry_hook, method_name)
+            method(*args)
+        except Exception:
+            self._logger.exception("Observer telemetry hook %s failed", method_name)

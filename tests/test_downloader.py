@@ -3,6 +3,8 @@ from typing import Any
 
 import pytest
 
+from core import DownloadResult as CoreDownloadResult
+from downloader import DownloadResult as PublicDownloadResult
 from downloader.config import DownloaderConfig
 from downloader.downloader import VideoDownloader
 from downloader.errors import DownloadError, MetadataExtractionError
@@ -58,6 +60,14 @@ def test_video_downloader_writes_metadata_beside_download(tmp_path: Path) -> Non
 
     result = downloader.download("https://example.test/watch/abc123")
 
+    assert isinstance(result, CoreDownloadResult)
+    assert PublicDownloadResult is CoreDownloadResult
+    assert result.source_url == "https://example.test/watch/abc123"
+    assert result.provider == "Example"
+    assert result.media_id == "abc123"
+    assert result.title == "Example Video"
+    assert result.duration_seconds == 42.0
+    assert result.metadata["id"] == "abc123"
     assert result.video_path == video_path
     assert result.metadata_path == video_path.with_name("abc123.mp4.metadata.json")
     assert result.metadata_path.exists()
