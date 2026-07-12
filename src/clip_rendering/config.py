@@ -21,3 +21,5 @@ class ClipRendererConfig:
     audio_codec: str = "aac"
     maximum_clips: int | None = 1
     ffmpeg_binary: str = "ffmpeg"
+    burn_subtitles: bool = False
+    subtitle_character_encoding: str = "UTF-8"

@@ -11,3 +11,7 @@ class RenderingFFmpegNotFoundError(ClipRenderingError):
 
 class InvalidRenderInputError(ClipRenderingError):
     """Raised when a score or candidate cannot be rendered safely."""
+
+
+class SubtitleRenderingError(ClipRenderingError):
+    """Raised when caption association or FFmpeg subtitle rendering fails."""

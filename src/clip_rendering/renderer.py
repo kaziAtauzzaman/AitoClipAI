@@ -5,11 +5,17 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Iterable, Protocol, Sequence
 
+from captioning import (
+    CaptionArtifact,
+    CandidateCaptionIdentity,
+    candidate_caption_identity,
+)
 from clip_rendering.config import ClipRendererConfig
 from clip_rendering.errors import (
     ClipRenderingError,
     InvalidRenderInputError,
     RenderingFFmpegNotFoundError,
+    SubtitleRenderingError,
 )
 from core import ClipScore, RenderJob
 
@@ -50,7 +56,11 @@ class ClipRenderer:
         self._executable_locator = executable_locator or shutil.which
         self._validate_config()
 
-    def render(self, scores: Iterable[ClipScore]) -> list[RenderJob]:
+    def render(
+        self,
+        scores: Iterable[ClipScore],
+        caption_artifacts: Iterable[CaptionArtifact] | None = None,
+    ) -> list[RenderJob]:
         """Sort scores, render the configured top candidates, and return jobs."""
 
         ranked = sorted(scores, key=self._ranking_key)
@@ -58,6 +68,7 @@ class ClipRenderer:
             ranked = ranked[: self._config.maximum_clips]
         if not ranked:
             return []
+        captions = self._caption_artifacts(caption_artifacts or [])
 
         ffmpeg_path = self._executable_locator(self._config.ffmpeg_binary)
         if ffmpeg_path is None:
@@ -73,7 +84,12 @@ class ClipRenderer:
             ) from exc
 
         return [
-            self._render_score(ffmpeg_path, score, rank)
+            self._render_score(
+                ffmpeg_path,
+                score,
+                rank,
+                self._caption_for_score(score, captions),
+            )
             for rank, score in enumerate(ranked, start=1)
         ]
 
@@ -82,6 +98,7 @@ class ClipRenderer:
         ffmpeg_path: str,
         score: ClipScore,
         rank: int,
+        caption_artifact: CaptionArtifact | None,
     ) -> RenderJob:
         candidate = score.candidate
         source_path = Path(candidate.source_video_path)
@@ -91,24 +108,50 @@ class ClipRenderer:
             raise InvalidRenderInputError("Clip start time cannot be negative.")
         if candidate.end_seconds <= candidate.start_seconds:
             raise InvalidRenderInputError("Clip end time must be after its start time.")
+        if caption_artifact is not None and not caption_artifact.path.is_file():
+            raise SubtitleRenderingError(
+                f"Caption artifact does not exist: {caption_artifact.path}"
+            )
 
         output_path = self._output_path(score, rank)
         if output_path.exists() and not self._config.overwrite_existing:
-            return self._render_job(score, output_path, rank, reused=True)
+            return self._render_job(
+                score,
+                output_path,
+                rank,
+                caption_artifact,
+                reused=True,
+            )
 
-        command = self._build_command(ffmpeg_path, score, output_path)
+        command = self._build_command(
+            ffmpeg_path,
+            score,
+            output_path,
+            caption_artifact,
+        )
         result = self._runner.run(command)
         if result.returncode != 0:
             diagnostic = result.stderr.strip() or result.stdout.strip()
             detail = f": {diagnostic}" if diagnostic else ""
-            raise ClipRenderingError(
+            error_type = (
+                SubtitleRenderingError
+                if caption_artifact is not None
+                else ClipRenderingError
+            )
+            raise error_type(
                 f"FFmpeg clip rendering failed with exit code {result.returncode}{detail}"
             )
         if not output_path.is_file():
             raise ClipRenderingError(
                 f"FFmpeg completed without creating rendered clip: {output_path}"
             )
-        return self._render_job(score, output_path, rank, reused=False)
+        return self._render_job(
+            score,
+            output_path,
+            rank,
+            caption_artifact,
+            reused=False,
+        )
 
     def _output_path(self, score: ClipScore, rank: int) -> Path:
         candidate = score.candidate
@@ -139,12 +182,22 @@ class ClipRenderer:
         ffmpeg_path: str,
         score: ClipScore,
         output_path: Path,
+        caption_artifact: CaptionArtifact | None,
     ) -> list[str]:
         candidate = score.candidate
         start = f"{candidate.start_seconds:.6f}"
         end = f"{candidate.end_seconds:.6f}"
+        video_filters = f"trim=start={start}:end={end},setpts=PTS-STARTPTS"
+        if caption_artifact is not None:
+            escaped_path = escape_subtitle_filter_path(caption_artifact.path)
+            character_encoding = escape_subtitle_filter_value(
+                self._config.subtitle_character_encoding
+            )
+            video_filters += (
+                f",subtitles=filename='{escaped_path}':charenc='{character_encoding}'"
+            )
         filter_graph = (
-            f"[0:v:0]trim=start={start}:end={end},setpts=PTS-STARTPTS[v];"
+            f"[0:v:0]{video_filters}[v];"
             f"[0:a:0]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a]"
         )
         return [
@@ -180,6 +233,7 @@ class ClipRenderer:
         score: ClipScore,
         output_path: Path,
         rank: int,
+        caption_artifact: CaptionArtifact | None,
         *,
         reused: bool,
     ) -> RenderJob:
@@ -187,6 +241,9 @@ class ClipRenderer:
         return RenderJob(
             candidate=candidate,
             output_path=output_path,
+            captions_path=(
+                caption_artifact.path if caption_artifact is not None else None
+            ),
             metadata={
                 "rank": rank,
                 "overall_score": score.overall_score,
@@ -199,8 +256,38 @@ class ClipRenderer:
                 "video_codec": self._config.video_codec,
                 "audio_codec": self._config.audio_codec,
                 "reused_existing": reused,
+                "subtitles_burned_in": caption_artifact is not None,
             },
         )
+
+    def _caption_artifacts(
+        self,
+        artifacts: Iterable[CaptionArtifact],
+    ) -> dict[CandidateCaptionIdentity, CaptionArtifact]:
+        indexed: dict[CandidateCaptionIdentity, CaptionArtifact] = {}
+        for artifact in artifacts:
+            identity = artifact.identity
+            if identity in indexed:
+                raise SubtitleRenderingError(
+                    "Multiple caption artifacts share one source path and time window."
+                )
+            indexed[identity] = artifact
+        return indexed
+
+    def _caption_for_score(
+        self,
+        score: ClipScore,
+        captions: dict[CandidateCaptionIdentity, CaptionArtifact],
+    ) -> CaptionArtifact | None:
+        if not self._config.burn_subtitles:
+            return None
+        identity = candidate_caption_identity(score.candidate)
+        artifact = captions.get(identity)
+        if artifact is None:
+            raise SubtitleRenderingError(
+                "No caption artifact matches the selected candidate source and window."
+            )
+        return artifact
 
     def _ranking_key(self, score: ClipScore) -> tuple[float, float, float, str, str]:
         candidate = score.candidate
@@ -220,6 +307,26 @@ class ClipRenderer:
             raise InvalidRenderInputError("Output format cannot be empty.")
         if not config.video_codec.strip() or not config.audio_codec.strip():
             raise InvalidRenderInputError("Video and audio codecs cannot be empty.")
+        if not config.subtitle_character_encoding.strip():
+            raise InvalidRenderInputError(
+                "Subtitle character encoding cannot be empty."
+            )
 
     def _normalized_output_format(self) -> str:
         return self._config.output_format.removeprefix(".")
+
+
+def escape_subtitle_filter_path(path: Path) -> str:
+    """Escape a subtitle filename for FFmpeg's filter-option parser."""
+
+    normalized = str(path).replace("\\", "/")
+    return escape_subtitle_filter_value(normalized)
+
+
+def escape_subtitle_filter_value(value: str) -> str:
+    """Escape characters significant inside a quoted FFmpeg filter value."""
+
+    escaped = value.replace("\\", "\\\\")
+    for character in (":", "'", ",", "[", "]", ";"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped

@@ -5,11 +5,13 @@ from clip_rendering.errors import (
     ClipRenderingError,
     InvalidRenderInputError,
     RenderingFFmpegNotFoundError,
+    SubtitleRenderingError,
 )
 from clip_rendering.renderer import (
     ClipRenderer,
     RenderCommandRunner,
     SubprocessRenderCommandRunner,
+    escape_subtitle_filter_path,
 )
 
 __all__ = [
@@ -19,5 +21,7 @@ __all__ = [
     "InvalidRenderInputError",
     "RenderCommandRunner",
     "RenderingFFmpegNotFoundError",
+    "SubtitleRenderingError",
     "SubprocessRenderCommandRunner",
+    "escape_subtitle_filter_path",
 ]
