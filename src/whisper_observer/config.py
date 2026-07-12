@@ -14,4 +14,5 @@ class WhisperObserverConfig:
     language: str | None = None
     task: str = "transcribe"
     device: str | None = None
+    deterministic: bool = True
     options: dict[str, Any] = field(default_factory=dict)

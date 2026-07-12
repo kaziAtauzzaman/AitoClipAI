@@ -33,7 +33,7 @@ class OpenAIWhisperBackend:
 
         whisper = self._load_whisper()
         model = self._load_model(whisper, config)
-        options = {**config.options, "task": config.task}
+        options = self._transcription_options(model, config)
         if config.language is not None:
             options["language"] = config.language
 
@@ -43,6 +43,21 @@ class OpenAIWhisperBackend:
             raise TranscriptionError(f"Whisper transcription failed: {exc}") from exc
 
         return self._normalize(raw)
+
+    def _transcription_options(
+        self,
+        model: Any,
+        config: WhisperObserverConfig,
+    ) -> dict[str, Any]:
+        options = {**config.options, "task": config.task}
+        if not config.deterministic:
+            return options
+
+        options["temperature"] = 0.0
+        options["condition_on_previous_text"] = True
+        if _model_uses_cpu(model, config):
+            options["fp16"] = False
+        return options
 
     def _load_whisper(self) -> ModuleType:
         try:
@@ -122,3 +137,15 @@ def _optional_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _model_uses_cpu(model: Any, config: WhisperObserverConfig) -> bool:
+    configured_device = config.device
+    if configured_device is not None:
+        return configured_device.casefold().split(":", maxsplit=1)[0] == "cpu"
+
+    model_device = getattr(model, "device", None)
+    if model_device is None:
+        return False
+    device_type = getattr(model_device, "type", model_device)
+    return str(device_type).casefold().split(":", maxsplit=1)[0] == "cpu"

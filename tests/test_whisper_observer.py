@@ -206,12 +206,155 @@ def test_openai_backend_uses_configured_model_and_preserves_fields(
     assert fake_model.calls == [
         (
             str(audio_path),
-            {"temperature": 0.0, "task": "transcribe", "language": "en"},
+            {
+                "temperature": 0.0,
+                "task": "transcribe",
+                "condition_on_previous_text": True,
+                "fp16": False,
+                "language": "en",
+            },
         )
     ]
     assert result.segments[0].speaker == "A"
     assert result.segments[0].confidence == 0.88
     assert result.segments[0].metadata["avg_logprob"] == -0.2
+
+
+def test_openai_backend_enforces_deterministic_decoding_options(
+    tmp_path: Path,
+) -> None:
+    class FakeDevice:
+        type = "cpu"
+
+    class FakeModel:
+        device = FakeDevice()
+
+        def __init__(self) -> None:
+            self.options: list[dict[str, object]] = []
+
+        def transcribe(self, path: str, **options: object) -> dict[str, object]:
+            self.options.append(options)
+            return {"text": "stable", "segments": []}
+
+    model = FakeModel()
+    module = ModuleType("whisper")
+    module.load_model = lambda name, **options: model  # type: ignore[attr-defined]
+    backend = OpenAIWhisperBackend(module_loader=lambda name: module)
+    config = WhisperObserverConfig(
+        options={
+            "temperature": (0.0, 0.2, 0.4),
+            "condition_on_previous_text": False,
+            "fp16": True,
+            "initial_prompt": "preserve this option",
+        }
+    )
+
+    backend.transcribe(tmp_path / "audio.wav", config)
+
+    assert model.options == [
+        {
+            "temperature": 0.0,
+            "condition_on_previous_text": True,
+            "fp16": False,
+            "initial_prompt": "preserve this option",
+            "task": "transcribe",
+        }
+    ]
+
+
+def test_openai_backend_preserves_legacy_fallback_when_determinism_disabled(
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.options: list[dict[str, object]] = []
+
+        def transcribe(self, path: str, **options: object) -> dict[str, object]:
+            self.options.append(options)
+            return {"text": "legacy", "segments": []}
+
+    model = FakeModel()
+    module = ModuleType("whisper")
+    module.load_model = lambda name, **options: model  # type: ignore[attr-defined]
+    backend = OpenAIWhisperBackend(module_loader=lambda name: module)
+    config = WhisperObserverConfig(
+        deterministic=False,
+        options={"temperature": (0.0, 0.2), "fp16": True},
+    )
+
+    backend.transcribe(tmp_path / "audio.wav", config)
+
+    assert model.options == [
+        {
+            "temperature": (0.0, 0.2),
+            "fp16": True,
+            "task": "transcribe",
+        }
+    ]
+
+
+def test_deterministic_backend_repeated_runs_are_equal(tmp_path: Path) -> None:
+    class FallbackSensitiveModel:
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        def transcribe(self, path: str, **options: object) -> dict[str, object]:
+            self.call_count += 1
+            deterministic = options.get("temperature") == 0.0
+            suffix = "stable" if deterministic else f"sample-{self.call_count}"
+            return {
+                "text": suffix,
+                "language": "en",
+                "segments": [
+                    {
+                        "start": 1.0,
+                        "end": 2.0,
+                        "text": suffix,
+                        "temperature": options.get("temperature"),
+                    }
+                ],
+            }
+
+    model = FallbackSensitiveModel()
+    module = ModuleType("whisper")
+    module.load_model = lambda name, **options: model  # type: ignore[attr-defined]
+    backend = OpenAIWhisperBackend(module_loader=lambda name: module)
+    config = WhisperObserverConfig()
+    audio_path = tmp_path / "audio.wav"
+
+    first = backend.transcribe(audio_path, config)
+    second = backend.transcribe(audio_path, config)
+
+    assert first == second
+    assert first.text == "stable"
+    assert first.segments[0].metadata["temperature"] == 0.0
+
+
+def test_deterministic_backend_does_not_force_fp16_off_for_gpu(
+    tmp_path: Path,
+) -> None:
+    class FakeModel:
+        device = "cuda:0"
+
+        def __init__(self) -> None:
+            self.options: dict[str, object] = {}
+
+        def transcribe(self, path: str, **options: object) -> dict[str, object]:
+            self.options = options
+            return {"text": "gpu", "segments": []}
+
+    model = FakeModel()
+    module = ModuleType("whisper")
+    module.load_model = lambda name, **options: model  # type: ignore[attr-defined]
+    backend = OpenAIWhisperBackend(module_loader=lambda name: module)
+
+    backend.transcribe(tmp_path / "audio.wav", WhisperObserverConfig(device="cuda:0"))
+
+    assert model.options["temperature"] == 0.0
+    assert model.options["condition_on_previous_text"] is True
+    assert "fp16" not in model.options
 
 
 def test_openai_backend_reports_missing_optional_runtime(tmp_path: Path) -> None:
