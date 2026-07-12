@@ -1,4 +1,6 @@
+from array import array
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -342,3 +344,179 @@ def test_clip_renderer_offline_audio_video_sync_integration(tmp_path: Path) -> N
     assert video_duration == pytest.approx(1.0, abs=0.08)
     assert audio_duration == pytest.approx(1.0, abs=0.08)
     assert abs(video_duration - audio_duration) <= 0.05
+
+
+def decoded_rms_dbfs(
+    path: Path,
+    *,
+    start: float,
+    end: float,
+) -> float:
+    """Decode a stable interior audio window and return its RMS level."""
+
+    decoded = subprocess.run(
+        [
+            shutil.which("ffmpeg") or "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-af",
+            f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    samples = array("h")
+    samples.frombytes(decoded)
+    assert samples
+    mean_square = sum(sample * sample for sample in samples) / len(samples)
+    if mean_square == 0:
+        return float("-inf")
+    return 20.0 * math.log10(math.sqrt(mean_square) / 32768.0)
+
+
+def probed_streams(path: Path) -> dict[str, dict[str, str]]:
+    """Return normalized FFprobe stream data for a rendered fixture."""
+
+    probe = subprocess.run(
+        [
+            shutil.which("ffprobe") or "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,start_time,duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        stream["codec_type"]: stream
+        for stream in json.loads(probe.stdout)["streams"]
+    }
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="FFmpeg and ffprobe are required",
+)
+def test_renderer_preserves_synthetic_audio_levels_silence_and_sync(
+    tmp_path: Path,
+) -> None:
+    """Regression coverage for quiet, normal, loud, and silent source audio."""
+
+    source_path = tmp_path / "audio-preservation-fixture.mp4"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg") or "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=30:duration=8",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=48000:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=550:sample_rate=48000:duration=2",
+            "-filter_complex",
+            "[2:a]volume=0.08[quiet];"
+            "[3:a]volume=1.0[normal];"
+            "[4:a]volume=4.0[loud];"
+            "[1:a][quiet][normal][loud]concat=n=4:v=0:a=1[a]",
+            "-map",
+            "0:v:0",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    windows = {
+        "silence": (0.25, 1.75),
+        "quiet": (2.25, 3.75),
+        "normal": (4.25, 5.75),
+        "loud": (6.25, 7.75),
+    }
+    scores = [
+        scored_candidate(source_path, start, end, 0.9, reason=name)
+        for name, (start, end) in windows.items()
+    ]
+    jobs = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            overwrite_existing=True,
+            maximum_clips=None,
+        )
+    ).render(scores)
+    jobs_by_name = {job.candidate.reason: job for job in jobs}
+
+    for name, (start, end) in windows.items():
+        job = jobs_by_name[name]
+        duration = end - start
+        source_level = decoded_rms_dbfs(
+            source_path,
+            start=start + 0.05,
+            end=end - 0.05,
+        )
+        output_level = decoded_rms_dbfs(
+            job.output_path,
+            start=0.05,
+            end=duration - 0.05,
+        )
+        if name == "silence":
+            assert source_level <= -60.0
+            assert output_level <= -60.0
+        else:
+            assert source_level > -60.0
+            assert output_level > -60.0
+            assert output_level == pytest.approx(source_level, abs=0.75)
+
+        streams = probed_streams(job.output_path)
+        assert set(streams) == {"video", "audio"}
+        video_start = float(streams["video"]["start_time"])
+        audio_start = float(streams["audio"]["start_time"])
+        video_duration = float(streams["video"]["duration"])
+        audio_duration = float(streams["audio"]["duration"])
+        assert video_start == pytest.approx(0.0, abs=0.02)
+        assert audio_start == pytest.approx(0.0, abs=0.02)
+        assert video_duration == pytest.approx(duration, abs=0.08)
+        assert audio_duration == pytest.approx(duration, abs=0.08)
+        assert abs(video_duration - audio_duration) <= 0.05

@@ -20,6 +20,15 @@ graph. `trim` and `atrim` cut the streams, while `setpts` and `asetpts` reset
 both timelines to zero before encoding. This preserves synchronization without
 separate seek operations.
 
+Offline audio-preservation regression coverage renders non-zero-start windows
+from a synthetic fixture containing silence, quiet audio, normal audio, and
+loud audio. Decoded source and output RMS levels must remain within a
+codec-aware 0.75 dB tolerance for non-silent windows, non-silent input must not
+become silent, and silence must remain below -60 dBFS. Every output must also
+retain near-zero stream starts and synchronized audio/video durations. These
+tests validate preservation only; the renderer does not apply normalization,
+gain, noise reduction, limiting, or other enhancement filters.
+
 `ClipRendererConfig` controls the output directory, filename template,
 overwrite behavior, container format, video codec, audio codec, maximum clip
 count, and FFmpeg executable. Deterministic filename fields include source stem,
