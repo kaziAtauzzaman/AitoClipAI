@@ -1,4 +1,8 @@
+from datetime import datetime, timezone
+from enum import Enum
+import json
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
@@ -9,6 +13,7 @@ from downloader.config import DownloaderConfig
 from downloader.downloader import VideoDownloader
 from downloader.errors import DownloadError, MetadataExtractionError
 from downloader.metadata import MetadataExtractor, MetadataWriter, VideoMetadata
+from downloader.sanitization import JsonMetadataSanitizer
 
 
 class FakeClient:
@@ -110,3 +115,122 @@ def test_metadata_writer_uses_configured_suffix(tmp_path: Path) -> None:
 
     assert metadata_path == tmp_path / "video.mp4.json"
     assert metadata_path.exists()
+
+
+class ExampleValue(Enum):
+    READY = "ready"
+
+
+class RuntimeOnlyObject:
+    pass
+
+
+def test_metadata_sanitizer_handles_non_copyable_runtime_objects() -> None:
+    lock = threading.Lock()
+    raw = {
+        "lock": lock,
+        "nested": [{"runtime": RuntimeOnlyObject()}],
+    }
+
+    sanitized = JsonMetadataSanitizer().sanitize(raw)
+
+    assert sanitized == {
+        "lock": {"__aitoclipai_unsupported_type__": "_thread.lock"},
+        "nested": [
+            {
+                "runtime": {
+                    "__aitoclipai_unsupported_type__": (
+                        f"{__name__}.RuntimeOnlyObject"
+                    )
+                }
+            }
+        ],
+    }
+    assert raw["lock"] is lock
+    assert isinstance(raw["nested"], list)
+    assert isinstance(raw["nested"][0]["runtime"], RuntimeOnlyObject)
+
+
+def test_metadata_sanitizer_detects_cycles_without_mutating_payload() -> None:
+    raw: dict[str, Any] = {"id": "cyclic"}
+    raw["self"] = raw
+
+    sanitized = JsonMetadataSanitizer().sanitize(raw)
+
+    assert sanitized == {
+        "id": "cyclic",
+        "self": {"__aitoclipai_cycle__": True},
+    }
+    assert raw["self"] is raw
+
+
+def test_metadata_sanitizer_preserves_useful_values_deterministically() -> None:
+    raw = {
+        "path": Path("media/video.mp4"),
+        "created": datetime(2026, 7, 12, 1, 2, 3, tzinfo=timezone.utc),
+        "status": ExampleValue.READY,
+        "binary": b"metadata",
+        "unordered": {"second", "first"},
+        "non_finite": float("nan"),
+    }
+    sanitizer = JsonMetadataSanitizer()
+
+    first = sanitizer.sanitize(raw)
+    second = sanitizer.sanitize(raw)
+
+    assert first == second
+    assert json.dumps(first, allow_nan=False, sort_keys=True) == json.dumps(
+        second,
+        allow_nan=False,
+        sort_keys=True,
+    )
+    assert first == {
+        "path": str(Path("media/video.mp4")),
+        "created": "2026-07-12T01:02:03+00:00",
+        "status": "ready",
+        "binary": {"__aitoclipai_bytes_base64__": "bWV0YWRhdGE="},
+        "unordered": ["first", "second"],
+        "non_finite": {"__aitoclipai_non_finite_float__": "nan"},
+    }
+
+
+def test_metadata_writer_persists_runtime_objects_as_stable_markers(
+    tmp_path: Path,
+) -> None:
+    payload = metadata_payload()
+    payload["runtime_lock"] = threading.Lock()
+    metadata = VideoMetadata.from_yt_dlp(payload)
+    writer = MetadataWriter(DownloaderConfig(downloads_dir=tmp_path))
+
+    first_path = writer.write(tmp_path / "video.mp4", metadata)
+    first_bytes = first_path.read_bytes()
+    second_path = writer.write(tmp_path / "video.mp4", metadata)
+
+    persisted = json.loads(second_path.read_text(encoding="utf-8"))
+    assert first_bytes == second_path.read_bytes()
+    assert persisted["id"] == "abc123"
+    assert persisted["title"] == "Example Video"
+    assert persisted["raw"]["runtime_lock"] == {
+        "__aitoclipai_unsupported_type__": "_thread.lock"
+    }
+    assert payload["runtime_lock"].locked() is False
+
+
+def test_video_downloader_returns_sanitized_metadata_for_runtime_objects(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"media")
+    payload = metadata_payload(video_path)
+    payload["runtime_lock"] = threading.Lock()
+    downloader = VideoDownloader(
+        config=DownloaderConfig(downloads_dir=tmp_path),
+        client=FakeClient(payload),
+    )
+
+    result = downloader.download("https://example.test/watch/abc123")
+
+    assert result.metadata["raw"]["runtime_lock"] == {
+        "__aitoclipai_unsupported_type__": "_thread.lock"
+    }
+    assert result.metadata_path.is_file()

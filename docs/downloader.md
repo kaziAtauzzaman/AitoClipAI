@@ -15,6 +15,8 @@ It does not implement clipping, transcription, or AI analysis.
 - `src/downloader/yt_dlp_client.py` - Adapter around `yt-dlp`.
 - `src/downloader/metadata.py` - Metadata extraction, normalization, and JSON
   writing.
+- `src/downloader/sanitization.py` - Deterministic conversion of arbitrary
+  provider metadata into JSON-safe values.
 - `src/downloader/downloader.py` - Download orchestration.
 
 ## Classes and Functions
@@ -42,7 +44,17 @@ Normalized metadata for one source video. It stores common fields used by future
 pipeline stages and also preserves the full raw yt-dlp payload.
 
 - `from_yt_dlp(info)` validates and converts raw yt-dlp metadata.
-- `to_dict()` returns a JSON-serializable dictionary.
+- `to_dict()` returns a JSON-serializable dictionary without deep-copying raw
+  provider runtime objects.
+
+### `JsonMetadataSanitizer`
+
+Recursively preserves useful JSON values and common value objects while
+replacing unsupported provider runtime objects with stable qualified-type
+markers. It detects cycles, provides deterministic ordering for sets, handles
+non-finite floats explicitly, and never mutates the original yt-dlp payload.
+This prevents metadata persistence from failing on objects such as thread
+locks while retaining the normalized metadata fields and usable raw values.
 
 ### `MetadataExtractor`
 

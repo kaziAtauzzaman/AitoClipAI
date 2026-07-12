@@ -1,12 +1,17 @@
 """Metadata extraction and serialization helpers."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Protocol
 
 from downloader.config import DownloaderConfig
 from downloader.errors import MetadataExtractionError
+from downloader.sanitization import (
+    JsonMetadataSanitizer,
+    JsonValue,
+    MetadataSanitizer,
+)
 
 
 class MetadataClient(Protocol):
@@ -62,10 +67,22 @@ class VideoMetadata:
             raw=info,
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(
+        self,
+        sanitizer: MetadataSanitizer | None = None,
+    ) -> dict[str, JsonValue]:
         """Return metadata as a JSON-serializable dictionary."""
 
-        return asdict(self)
+        json_sanitizer = sanitizer or JsonMetadataSanitizer()
+        return {
+            "id": self.id,
+            "title": self.title,
+            "uploader": self.uploader,
+            "duration": self.duration,
+            "webpage_url": self.webpage_url,
+            "extractor": self.extractor,
+            "raw": json_sanitizer.sanitize(self.raw),
+        }
 
 
 class MetadataExtractor:
@@ -86,10 +103,15 @@ class MetadataExtractor:
 class MetadataWriter:
     """Persist metadata beside downloaded videos."""
 
-    def __init__(self, config: DownloaderConfig) -> None:
+    def __init__(
+        self,
+        config: DownloaderConfig,
+        sanitizer: MetadataSanitizer | None = None,
+    ) -> None:
         """Initialize the writer with downloader configuration."""
 
         self._config = config
+        self._sanitizer = sanitizer or JsonMetadataSanitizer()
 
     def metadata_path_for(self, video_path: Path) -> Path:
         """Return the JSON metadata path for a downloaded video path."""
@@ -102,7 +124,13 @@ class MetadataWriter:
         metadata_path = self.metadata_path_for(video_path)
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(
-            json.dumps(metadata.to_dict(), default=str, indent=2, sort_keys=True),
+            json.dumps(
+                metadata.to_dict(self._sanitizer),
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
         return metadata_path
