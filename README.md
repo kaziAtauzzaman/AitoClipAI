@@ -4,7 +4,8 @@ AitoClipAI is a modular Python pipeline for turning prerecorded source video
 into deterministic candidate clips. The current architecture supports source
 download or local media, FFmpeg audio extraction, audio analysis, optional
 Whisper transcription, timeline aggregation, candidate generation, explainable
-scoring, FFmpeg clip rendering, and optional burned-in SRT subtitles.
+scoring, FFmpeg clip rendering, optional burned-in SRT subtitles, and
+deterministic post-pipeline heuristic/provenance feedback.
 
 ## Requirements
 
@@ -54,3 +55,4 @@ directory. See `docs/pipeline-validation-0.1.md` for details.
 - `src/clip_rendering/` — synchronized FFmpeg rendering
 - `src/captioning/` — optional SRT generation and subtitle burn-in support
 - `src/pipeline/` — analysis and prerecorded-pipeline composition
+- `src/explainable_feedback/` — deterministic scored-clip provenance reports
