@@ -93,6 +93,30 @@ class AggregatedTimeline:
 
 
 @dataclass(frozen=True, slots=True)
+class FeatureTimelineFailure:
+    """Serializable observer failure captured during timeline production."""
+
+    observer: str
+    error_type: str
+    message: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureTimeline:
+    """Complete persisted output of one media-analysis pipeline run."""
+
+    media_path: Path
+    audio_path: Path
+    timeline_path: Path
+    timeline: AggregatedTimeline
+    source_url: str | None = None
+    download: "DownloadResult | None" = None
+    failures: list[FeatureTimelineFailure] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class DownloadResult:
     """Output contract produced by the downloader stage.
 
