@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aitoclipai"
 version = "0.0.0"
-description = "AitoClipAI Python project scaffold."
+description = "Deterministic prerecorded-video analysis and clip generation pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -19,6 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+]
+transcription = [
+  "openai-whisper",
 ]
 
 [tool.setuptools]

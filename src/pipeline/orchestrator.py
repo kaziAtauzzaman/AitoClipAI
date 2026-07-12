@@ -26,6 +26,7 @@ class PipelineConfig:
     """Runtime configuration owned by the orchestration layer."""
 
     timeline_suffix: str = ".feature-timeline.json"
+    timeline_dir: Path | None = None
 
 
 class PipelineOrchestrator:
@@ -127,4 +128,7 @@ class PipelineOrchestrator:
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     def _timeline_path(self, media_path: Path) -> Path:
-        return media_path.with_name(f"{media_path.name}{self._config.timeline_suffix}")
+        filename = f"{media_path.name}{self._config.timeline_suffix}"
+        if self._config.timeline_dir is not None:
+            return self._config.timeline_dir / filename
+        return media_path.with_name(filename)
