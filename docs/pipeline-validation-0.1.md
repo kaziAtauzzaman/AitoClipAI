@@ -12,6 +12,10 @@ source acquisition and transcription, and run acquisition, metadata, analysis,
 candidate generation, scoring, caption-free rendering, and FFprobe validation
 without network access or model downloads.
 
+After threshold filtering, deterministic candidate selection suppresses weaker
+windows that substantially overlap stronger passing candidates. All scores and
+threshold results remain available; only selected passing scores are rendered.
+
 Rendered clips must exist, be nonempty, contain audio and video streams, have
 positive duration, start within 0.05 seconds of zero, and keep audio/video
 duration differences within 0.08 seconds.

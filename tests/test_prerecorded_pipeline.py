@@ -22,6 +22,7 @@ from core import (
     RenderJob,
 )
 from downloader import DownloaderConfig, VideoDownloader
+from explainable_feedback import ExplainableFeedbackGenerator
 from observers import ObserverEngine, ObserverRegistry
 from pipeline import (
     ArtifactValidationError,
@@ -174,6 +175,56 @@ def test_prerecorded_pipeline_renders_only_passing_scores_and_reports(
     assert result.report_path == tmp_path / "report.json"
     assert "stage_started stage=analysis" in caplog.text
     assert "pipeline_validation_passed" in caplog.text
+
+
+def test_pipeline_suppresses_overlap_before_rendering_and_preserves_scores(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    source = tmp_path / "source.mp4"
+    stronger_candidate = ClipCandidate(source, 0.0, 10.0, "stronger")
+    weaker_candidate = ClipCandidate(source, 1.0, 9.0, "weaker")
+    stronger = ClipScore(stronger_candidate, 0.9, passed_threshold=True)
+    weaker = ClipScore(weaker_candidate, 0.8, passed_threshold=True)
+    output = tmp_path / "clip.mp4"
+    output.write_bytes(b"clip")
+    job = RenderJob(stronger_candidate, output)
+    video = MediaStreamProbe("video", "h264", 0.0, 10.0)
+    audio = MediaStreamProbe("audio", "aac", 0.0, 10.0)
+    artifact = RenderedArtifactValidation(
+        output,
+        output.stat().st_size,
+        video,
+        audio,
+        10.0,
+        {"valid": True},
+    )
+    renderer = FakeRenderer([job])
+    logger = logging.getLogger("test.validation.selection")
+    pipeline = PrerecordedVideoPipeline(
+        analysis_pipeline=FakeAnalysis(timeline(tmp_path)),
+        candidate_generator=FakeGenerator([stronger_candidate, weaker_candidate]),
+        candidate_scorer=FakeScorer([weaker, stronger]),
+        clip_renderer=renderer,
+        artifact_validator=FakeValidator(source, artifact),
+        report_writer=FakeReportWriter(tmp_path / "report.json"),
+        logger=logger,
+    )
+
+    with caplog.at_level(logging.INFO, logger="test.validation.selection"):
+        result = pipeline.run(source)
+
+    assert result.scores == [weaker, stronger]
+    assert result.selected_scores == [weaker, stronger]
+    assert renderer.received == [stronger]
+    assert result.validation_report.passing_score_count == 2
+    assert "selected=1 suppressed=1" in caplog.text
+    feedback = ExplainableFeedbackGenerator().generate(result)
+    statuses = {
+        clip.identity.start_microseconds: clip.selection_status
+        for clip in feedback.clips
+    }
+    assert statuses == {1_000_000: "passed_not_rendered", 0: "rendered"}
 
 
 @pytest.mark.parametrize("missing", ["audio", "whisper"])

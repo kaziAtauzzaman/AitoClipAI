@@ -12,6 +12,7 @@ from audio_observer import (
 )
 from candidate_generation import CandidateGenerator
 from candidate_scoring import CandidateScorer
+from candidate_selection import CandidateSelectionResult, CandidateSelector
 from clip_rendering import ClipRenderer, ClipRendererConfig
 from core import ClipCandidate, ClipScore, FeatureTimeline, RenderJob
 from downloader import DownloaderConfig, VideoDownloader
@@ -56,6 +57,13 @@ class CandidateScoringService(Protocol):
 
     def score(self, candidates: Iterable[ClipCandidate]) -> list[ClipScore]:
         """Return ranked scores."""
+
+
+class CandidateSelectionService(Protocol):
+    """Suppress weaker substantially overlapping passing scores."""
+
+    def select(self, scores: Iterable[ClipScore]) -> CandidateSelectionResult:
+        """Return scores selected for rendering and suppression provenance."""
 
 
 class ClipRenderingService(Protocol):
@@ -104,6 +112,7 @@ class PrerecordedVideoPipeline:
         report_writer: ValidationReportWriter | None = None,
         config: PrerecordedPipelineConfig | None = None,
         logger: logging.Logger | None = None,
+        candidate_selector: CandidateSelectionService | None = None,
     ) -> None:
         self._config = config or PrerecordedPipelineConfig()
         if not {"audio", "whisper"}.issubset(self._config.required_observers):
@@ -113,6 +122,7 @@ class PrerecordedVideoPipeline:
         self._analysis_pipeline = analysis_pipeline or self._default_analysis()
         self._candidate_generator = candidate_generator or CandidateGenerator()
         self._candidate_scorer = candidate_scorer or CandidateScorer()
+        self._candidate_selector = candidate_selector or CandidateSelector()
         self._clip_renderer = clip_renderer or ClipRenderer(
             ClipRendererConfig(
                 output_dir=self._config.run_dir / "clips",
@@ -151,9 +161,21 @@ class PrerecordedVideoPipeline:
             len(selected),
         )
 
+        selection = self._stage(
+            "candidate_selection",
+            lambda: self._candidate_selector.select(selected),
+        )
+        self._logger.info(
+            "stage_result stage=candidate_selection passing=%d selected=%d "
+            "suppressed=%d",
+            len(selected),
+            len(selection.selected),
+            len(selection.suppressed),
+        )
+
         render_jobs = self._stage(
             "clip_rendering",
-            lambda: self._render_scores(selected),
+            lambda: self._render_scores(selection.selected),
         )
         source_metadata = self._stage(
             "source_probe",

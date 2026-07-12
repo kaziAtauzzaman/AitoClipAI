@@ -52,6 +52,7 @@ directory. See `docs/pipeline-validation-0.1.md` for details.
 - `src/aggregation/` — feature timeline construction
 - `src/candidate_generation/` — deterministic clip-window generation
 - `src/candidate_scoring/` — explainable heuristic scoring
+- `src/candidate_selection/` — deterministic overlap suppression before render
 - `src/clip_rendering/` — synchronized FFmpeg rendering
 - `src/captioning/` — optional SRT generation and subtitle burn-in support
 - `src/pipeline/` — analysis and prerecorded-pipeline composition
