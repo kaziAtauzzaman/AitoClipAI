@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from difflib import SequenceMatcher
+import hashlib
 from pathlib import Path
 import re
 import tempfile
@@ -83,6 +84,8 @@ class IncrementalWhisperSessionCore:
         self._channels: int | None = None
         self._sample_width: int | None = None
         self._expected_chunk_start: int | None = None
+        self._last_chunk_identity: str | None = None
+        self._last_chunk_batch: IncrementalWhisperBatch | None = None
         self._lifecycle = IncrementalWhisperLifecycle.NEW
 
     @property
@@ -101,6 +104,10 @@ class IncrementalWhisperSessionCore:
         """Commit one successfully transcribed chronological PCM chunk."""
 
         self._require_active()
+        identity = _chunk_identity(chunk)
+        if identity == self._last_chunk_identity:
+            assert self._last_chunk_batch is not None
+            return self._last_chunk_batch
         self._validate_chunk_sequence(chunk)
         self._validate_result(result)
         candidates = [self._global_segment(item, chunk) for item in result.segments]
@@ -139,7 +146,26 @@ class IncrementalWhisperSessionCore:
         self._sample_width = chunk.sample_width_bytes
         self._expected_chunk_start = chunk.stable_through_frame
         self._lifecycle = IncrementalWhisperLifecycle.ACTIVE
-        return self._batch(stable, eof=False)
+        batch = self._batch(stable, eof=False)
+        self._last_chunk_identity = identity
+        self._last_chunk_batch = batch
+        return batch
+
+    def accepted_batch(
+        self,
+        chunk: IncrementalWhisperAudioChunk,
+    ) -> IncrementalWhisperBatch | None:
+        """Return the durable receipt for the most recently committed chunk."""
+
+        if _chunk_identity(chunk) != self._last_chunk_identity:
+            return None
+        return self._last_chunk_batch
+
+    def validate_chunk(self, chunk: IncrementalWhisperAudioChunk) -> None:
+        """Validate transport ordering without mutating transcript state."""
+
+        self._require_active()
+        self._validate_chunk_sequence(chunk)
 
     def flush(self, eof: IncrementalWhisperEOF) -> IncrementalWhisperBatch | None:
         """Finalize provisional speech after an authoritative transport EOF."""
@@ -549,3 +575,20 @@ def _segment_key(segment: TranscriptionSegment) -> tuple[float, float, str, str]
 
 def _finite(value: float) -> bool:
     return value == value and value not in {float("inf"), float("-inf")}
+
+
+def _chunk_identity(chunk: IncrementalWhisperAudioChunk) -> str:
+    """Return a deterministic identity for one exact PCM transport unit."""
+
+    digest = hashlib.sha256()
+    for value in (
+        chunk.sample_rate_hz,
+        chunk.channels,
+        chunk.sample_width_bytes,
+        chunk.start_frame,
+        chunk.end_frame,
+        chunk.stable_through_frame,
+    ):
+        digest.update(value.to_bytes(8, byteorder="big", signed=False))
+    digest.update(chunk.pcm_bytes)
+    return digest.hexdigest()

@@ -23,6 +23,7 @@ from whisper_observer.incremental import (
     IncrementalWavWhisperSession,
     TokenOverlapReconciliationPolicy,
 )
+from whisper_observer.live import LivePcmWhisperObserver, LivePcmWhisperSession
 from whisper_observer.errors import (
     InvalidTranscriptionError,
     TranscriptionError,
@@ -42,6 +43,8 @@ __all__ = [
     "IncrementalWhisperSessionCore",
     "IncrementalWavWhisperObserver",
     "IncrementalWavWhisperSession",
+    "LivePcmWhisperObserver",
+    "LivePcmWhisperSession",
     "OpenAIWhisperBackend",
     "OpenAIWhisperModelSession",
     "SegmentReconciliationPolicy",

@@ -1,8 +1,11 @@
+import gc
 import json
 import math
 import shutil
 import struct
+import threading
 import wave
+import weakref
 from pathlib import Path
 from types import ModuleType
 
@@ -19,6 +22,7 @@ from whisper_observer import (
     IncrementalWhisperObserverConfig,
     IncrementalWhisperSessionCore,
     IncrementalWavWhisperObserver,
+    LivePcmWhisperObserver,
     OpenAIWhisperBackend,
     TranscriptionError,
     TranscriptionResult,
@@ -146,6 +150,22 @@ def incremental_whisper_observer(
         backend,
     )
     return observer, backend
+
+
+def live_pcm_chunk(
+    start_frame: int,
+    end_frame: int,
+    stable_through_frame: int,
+) -> IncrementalWhisperAudioChunk:
+    return IncrementalWhisperAudioChunk(
+        pcm_bytes=b"\x00\x00" * (end_frame - start_frame),
+        sample_rate_hz=10,
+        channels=1,
+        sample_width_bytes=2,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        stable_through_frame=stable_through_frame,
+    )
 
 
 def test_whisper_observer_emits_timestamped_speech_observations(
@@ -513,6 +533,267 @@ def test_incremental_whisper_core_accepts_transport_neutral_pcm() -> None:
     assert batch.watermark_seconds == 3.0
     assert eof is not None and eof.watermark_seconds == 4.0
     assert core.flush(IncrementalWhisperEOF(40, 10)) is None
+
+
+def test_live_pcm_adapter_preserves_provisional_and_watermark_semantics() -> None:
+    backend = ScriptedIncrementalBackend(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(3.2, 3.8, "Wait, what?")]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.2, 0.8, "wait what")]
+            ),
+        ]
+    )
+    observer = LivePcmWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+        ),
+        backend,
+    )
+
+    with observer.session() as session:
+        first = session.submit_chunk(live_pcm_chunk(0, 40, 30))
+        second = session.submit_chunk(live_pcm_chunk(30, 70, 60))
+        eof = session.flush(IncrementalWhisperEOF(70, 10))
+        repeated = session.flush(IncrementalWhisperEOF(70, 10))
+
+    assert first.observations == ()
+    assert first.watermark_seconds == 3.0
+    assert [item.value["text"] for item in second.observations] == ["wait what"]
+    assert second.watermark_seconds == 6.0
+    assert eof is not None and eof.watermark_seconds == 7.0
+    assert repeated is None
+    assert backend.open_calls == [WhisperObserverConfig()]
+
+
+def test_live_pcm_adapter_retries_before_accepting_later_audio() -> None:
+    class RetryLiveModelSession:
+        def __init__(self) -> None:
+            self.calls: list[bytes] = []
+
+        def transcribe(
+            self,
+            audio_path: Path,
+            initial_prompt: str | None,
+        ) -> TranscriptionResult:
+            with wave.open(str(audio_path), "rb") as audio:
+                payload = audio.readframes(audio.getnframes())
+            self.calls.append(payload)
+            if len(self.calls) == 1:
+                raise TranscriptionError("live model busy")
+            if len(self.calls) == 2:
+                return TranscriptionResult(
+                    segments=[TranscriptionSegment(1.0, 2.0, "retry live")]
+                )
+            return TranscriptionResult()
+
+        def close(self) -> None:
+            pass
+
+    class RetryLiveBackend:
+        def __init__(self) -> None:
+            self.model = RetryLiveModelSession()
+
+        def open_incremental_session(self, config: WhisperObserverConfig):
+            return self.model
+
+    backend = RetryLiveBackend()
+    observer = LivePcmWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+        ),
+        backend,
+    )
+    first_chunk = live_pcm_chunk(0, 40, 30)
+    second_chunk = live_pcm_chunk(30, 70, 60)
+
+    with observer.session() as session:
+        with pytest.raises(TranscriptionError, match="live model busy"):
+            session.submit_chunk(first_chunk)
+        assert session.has_pending_retry is True
+        with pytest.raises(TranscriptionError, match="Retry the pending"):
+            session.submit_chunk(second_chunk)
+        with pytest.raises(TranscriptionError, match="needs retry"):
+            session.flush(IncrementalWhisperEOF(40, 10))
+        retried = session.retry_pending()
+        later = session.submit_chunk(second_chunk)
+        eof = session.flush(IncrementalWhisperEOF(70, 10))
+
+    assert backend.model.calls[0] == backend.model.calls[1]
+    assert [item.value["text"] for item in retried.observations] == ["retry live"]
+    assert later.observations == ()
+    assert eof is not None and eof.observations == ()
+
+
+def test_live_pcm_adapter_rejects_non_authoritative_eof_and_bad_order() -> None:
+    observer = LivePcmWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+        ),
+        ScriptedIncrementalBackend([TranscriptionResult()]),
+    )
+
+    with observer.session() as session:
+        batch = session.submit_chunk(live_pcm_chunk(0, 40, 30))
+        with pytest.raises(TranscriptionError, match="confirmed stable edge"):
+            session.submit_chunk(live_pcm_chunk(31, 70, 60))
+        assert session.has_pending_retry is False
+        with pytest.raises(TranscriptionError, match="committed PCM frontier"):
+            session.flush(IncrementalWhisperEOF(41, 10))
+        eof = session.flush(IncrementalWhisperEOF(40, 10))
+
+    assert batch.watermark_seconds == 3.0
+    assert eof is not None and eof.watermark_seconds == 4.0
+
+
+def test_live_pcm_adapter_recovers_interruption_after_core_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ScriptedIncrementalBackend(
+        [TranscriptionResult(segments=[TranscriptionSegment(1.0, 2.0, "once")])]
+    )
+    session = LivePcmWhisperObserver(
+        IncrementalWhisperObserverConfig(chunk_seconds=4.0, overlap_seconds=1.0),
+        backend,
+    ).session()
+    chunk = live_pcm_chunk(0, 40, 30)
+    original_accept = session._core.accept_chunk
+
+    def accept_then_interrupt(*args, **kwargs):
+        original_accept(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(session._core, "accept_chunk", accept_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        session.submit_chunk(chunk)
+    assert session.has_pending_retry is True
+
+    monkeypatch.setattr(session._core, "accept_chunk", original_accept)
+    recovered = session.retry_pending()
+    session.close()
+
+    assert [item.value["text"] for item in recovered.observations] == ["once"]
+    assert backend.session is not None
+    assert len(backend.session.calls) == 1
+    assert session.has_pending_retry is False
+
+
+def test_live_pcm_adapter_rejects_concurrent_lifecycle_calls() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingModelSession:
+        def transcribe(self, audio_path: Path, initial_prompt: str | None):
+            entered.set()
+            assert release.wait(timeout=5)
+            return TranscriptionResult()
+
+        def close(self) -> None:
+            pass
+
+    class BlockingBackend:
+        def open_incremental_session(self, config: WhisperObserverConfig):
+            return BlockingModelSession()
+
+    session = LivePcmWhisperObserver(
+        IncrementalWhisperObserverConfig(chunk_seconds=4.0, overlap_seconds=1.0),
+        BlockingBackend(),
+    ).session()
+    failures: list[BaseException] = []
+
+    def submit() -> None:
+        try:
+            session.submit_chunk(live_pcm_chunk(0, 40, 30))
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=submit)
+    worker.start()
+    assert entered.wait(timeout=5)
+    with pytest.raises(RuntimeError, match="session is busy"):
+        session.close()
+    with pytest.raises(RuntimeError, match="session is busy"):
+        session.retry_pending()
+    release.set()
+    worker.join(timeout=5)
+    session.close()
+
+    assert worker.is_alive() is False
+    assert failures == []
+
+
+def test_live_pcm_adapter_truncates_reused_temporary_wav() -> None:
+    class PayloadModelSession:
+        def __init__(self) -> None:
+            self.payloads: list[bytes] = []
+
+        def transcribe(self, audio_path: Path, initial_prompt: str | None):
+            with wave.open(str(audio_path), "rb") as audio:
+                self.payloads.append(audio.readframes(audio.getnframes()))
+            return TranscriptionResult()
+
+        def close(self) -> None:
+            pass
+
+    class PayloadBackend:
+        def __init__(self) -> None:
+            self.model = PayloadModelSession()
+
+        def open_incremental_session(self, config: WhisperObserverConfig):
+            return self.model
+
+    backend = PayloadBackend()
+    with LivePcmWhisperObserver(
+        IncrementalWhisperObserverConfig(chunk_seconds=4.0, overlap_seconds=1.0),
+        backend,
+    ).session() as session:
+        first = live_pcm_chunk(0, 40, 30)
+        second = live_pcm_chunk(30, 45, 45)
+        session.submit_chunk(first)
+        session.submit_chunk(second)
+
+    assert backend.model.payloads == [first.pcm_bytes, second.pcm_bytes]
+
+
+def test_live_pcm_adapter_abandoned_and_repeated_cleanup_is_harmless() -> None:
+    backend = ScriptedIncrementalBackend([])
+    session = LivePcmWhisperObserver(backend=backend).session()
+    temporary_path = Path(session._temporary_directory.name)
+    session_reference = weakref.ref(session)
+
+    del session
+    gc.collect()
+
+    assert session_reference() is None
+    assert backend.session is not None
+    assert backend.session.close_calls == 1
+    assert temporary_path.exists() is False
+
+    explicit = LivePcmWhisperObserver(backend=backend).session()
+    explicit.close()
+    explicit.close()
+    assert backend.session is not None
+    assert backend.session.close_calls == 1
+
+
+def test_live_pcm_adapter_concurrent_sessions_use_isolated_paths() -> None:
+    first = LivePcmWhisperObserver(
+        backend=ScriptedIncrementalBackend([])
+    ).session()
+    second = LivePcmWhisperObserver(
+        backend=ScriptedIncrementalBackend([])
+    ).session()
+    try:
+        assert first._chunk_path != second._chunk_path
+        assert first._chunk_path.parent != second._chunk_path.parent
+    finally:
+        first.close()
+        second.close()
 
 
 def test_incremental_whisper_deduplicates_overlap_segments(tmp_path: Path) -> None:

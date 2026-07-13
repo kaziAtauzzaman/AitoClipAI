@@ -12,6 +12,27 @@ one reusable chunk WAV for the model, and never uses
 `CompletedTimelineReplayAdapter` or future audio content. A failed transcription
 retains the prepared PCM chunk and retries it before reading additional frames.
 
+`LivePcmWhisperObserver` creates push-based sessions for an external live PCM
+producer. Callers submit the same `IncrementalWhisperAudioChunk` contract used
+by the core and finish with `IncrementalWhisperEOF`. The adapter holds at most
+one failed chunk. While that chunk is pending, later input and EOF are rejected;
+`retry_pending()` transcribes the identical PCM payload before progress resumes.
+No live duration or EOF is inferred from buffered audio.
+
+Live session methods are synchronous and guarded against concurrent or
+reentrant use. The session is intentionally single-caller rather than a
+thread-safe work queue: a conflicting `submit_chunk()`, `retry_pending()`,
+`flush()`, or `close()` fails immediately and may be retried after the active
+operation completes. This also prevents concurrent reuse or deletion of the
+temporary chunk WAV. Explicit close remains preferred; an idempotent finalizer
+closes the model handle and removes temporary resources if ownership is
+abandoned.
+
+The core retains only the identity and batch receipt for its most recently
+committed chunk. A live retry can therefore recover an acceptance interrupted
+between the core commit and adapter bookkeeping without retranscribing or
+emitting the batch twice.
+
 One model session is opened for the source and reused for every chunk. A chunk
 contains `chunk_seconds` of audio and the next chunk starts
 `chunk_seconds - overlap_seconds` later. Chunk-relative segment timestamps are
