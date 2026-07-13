@@ -36,6 +36,12 @@ from pipeline import (
     ObserverWatermarks,
     RenderLifecycleState,
 )
+from whisper_observer import (
+    IncrementalWhisperObserverConfig,
+    IncrementalWavWhisperObserver,
+    TranscriptionResult,
+    TranscriptionSegment,
+)
 
 
 class MarkerGenerator:
@@ -158,6 +164,34 @@ def _write_incremental_audio_fixture(path: Path) -> None:
         )
 
 
+class CoordinatorWhisperModelSession:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def transcribe(self, audio_path: Path, initial_prompt: str | None):
+        self.calls += 1
+        if self.calls == 1:
+            return TranscriptionResult(
+                segments=[
+                    TranscriptionSegment(
+                        0.2,
+                        0.8,
+                        "incremental speech",
+                        confidence=0.9,
+                    )
+                ]
+            )
+        return TranscriptionResult()
+
+    def close(self) -> None:
+        pass
+
+
+class CoordinatorWhisperBackend:
+    def open_incremental_session(self, config):
+        return CoordinatorWhisperModelSession()
+
+
 def test_real_incremental_audio_drives_coordinator_across_watermarks(
     tmp_path: Path,
 ) -> None:
@@ -229,6 +263,75 @@ def test_real_incremental_audio_drives_coordinator_across_watermarks(
     assert incremental.lifecycle is CoordinatorLifecycle.FLUSHED
 
 
+def test_real_incremental_whisper_feeds_production_decision_components(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "speech.wav"
+    media_path = tmp_path / "source.mp4"
+    _write_incremental_audio_fixture(audio_path)
+    media_path.write_bytes(b"source")
+    observer = IncrementalWavWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=2.0,
+            overlap_seconds=0.5,
+        ),
+        CoordinatorWhisperBackend(),
+    )
+    renderer = RecordingRenderer(tmp_path)
+    incremental = IncrementalPrerecordedCoordinator(
+        candidate_generator=CandidateGenerator(),
+        candidate_scorer=CandidateScorer(
+            CandidateScoringConfig(passing_score=0.0)
+        ),
+        candidate_selector=CandidateSelector(),
+        clip_renderer=renderer,
+        config=IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+    )
+    speech = []
+
+    for batch in observer.batches(audio_path):
+        speech.extend(batch.observations)
+        duration = batch.frames_processed / 10
+        results = [
+            ObserverResult(
+                "audio",
+                [],
+                {"duration_seconds": duration},
+            ),
+            ObserverResult(
+                "whisper",
+                list(speech),
+                {"duration_seconds": duration},
+            ),
+        ]
+        timeline = FeatureTimeline(
+            media_path=media_path,
+            audio_path=audio_path,
+            timeline_path=tmp_path / "timeline.json",
+            timeline=FeatureAggregator().aggregate(results),
+            metadata={"source_id": "incremental-whisper-fixture"},
+        )
+        watermarks = ObserverWatermarks(
+            {
+                "audio": duration,
+                "whisper": batch.watermark_seconds,
+            }
+        )
+        if batch.eof:
+            completed = incremental.flush(
+                timeline,
+                IncrementalEOF(batch.watermark_seconds, watermarks),
+            )
+        else:
+            incremental.advance(timeline, watermarks)
+
+    assert completed.selected_scores
+    assert completed.selected_scores[0].candidate.source_signals == [
+        "whisper_speech"
+    ]
+    assert len(completed.render_jobs) == 1
+
+
 def test_coordinator_uses_only_explicit_observer_watermark(tmp_path: Path) -> None:
     timeline = feature_timeline(
         tmp_path,
@@ -240,6 +343,56 @@ def test_coordinator_uses_only_explicit_observer_watermark(tmp_path: Path) -> No
     assert pipeline.advance(timeline, watermarks(9.9)) == []
     assert pipeline.advance(timeline, watermarks(10))
     assert pipeline.watermark_seconds == 10
+
+
+def test_slower_whisper_watermark_blocks_audio_ahead(tmp_path: Path) -> None:
+    timeline = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "speech"}],
+    )
+    renderer = RecordingRenderer(tmp_path)
+    incremental = coordinator(
+        tmp_path,
+        renderer,
+        required_observers=("audio", "whisper"),
+    )
+
+    assert incremental.advance(
+        timeline,
+        ObserverWatermarks({"audio": 20.0, "whisper": 9.0}),
+    ) == []
+    assert incremental.watermark_seconds == 9.0
+    jobs = incremental.advance(
+        timeline,
+        ObserverWatermarks({"audio": 20.0, "whisper": 10.0}),
+    )
+
+    assert len(jobs) == 1
+    assert incremental.watermark_seconds == 10.0
+
+
+def test_combined_audio_and_whisper_eof_allows_final_flush(tmp_path: Path) -> None:
+    timeline = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "speech"}],
+    )
+    renderer = RecordingRenderer(tmp_path)
+    incremental = coordinator(
+        tmp_path,
+        renderer,
+        required_observers=("audio", "whisper"),
+    )
+
+    result = incremental.flush(
+        timeline,
+        IncrementalEOF(
+            12.0,
+            ObserverWatermarks({"audio": 12.0, "whisper": 12.0}),
+        ),
+    )
+
+    assert incremental.lifecycle is CoordinatorLifecycle.FLUSHED
+    assert len(result.render_jobs) == 1
 
 
 def test_replay_adapter_withholds_retroactive_observation(tmp_path: Path) -> None:

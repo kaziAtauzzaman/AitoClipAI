@@ -14,6 +14,11 @@ from observers import ObserverContext, ObserverEngine, ObserverRegistry
 from pipeline import PipelineOrchestrator
 from whisper_observer import (
     InvalidTranscriptionError,
+    IncrementalWhisperAudioChunk,
+    IncrementalWhisperEOF,
+    IncrementalWhisperObserverConfig,
+    IncrementalWhisperSessionCore,
+    IncrementalWavWhisperObserver,
     OpenAIWhisperBackend,
     TranscriptionError,
     TranscriptionResult,
@@ -64,6 +69,41 @@ class FixtureAudioBackend:
         )
 
 
+class ScriptedIncrementalModelSession:
+    def __init__(self, results: list[TranscriptionResult]) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[float, str | None]] = []
+        self.close_calls = 0
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        initial_prompt: str | None,
+    ) -> TranscriptionResult:
+        with wave.open(str(audio_path), "rb") as audio:
+            duration = audio.getnframes() / audio.getframerate()
+        self.calls.append((duration, initial_prompt))
+        return self.results.pop(0) if self.results else TranscriptionResult()
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class ScriptedIncrementalBackend:
+    def __init__(self, results: list[TranscriptionResult]) -> None:
+        self.results = results
+        self.open_calls: list[WhisperObserverConfig] = []
+        self.session: ScriptedIncrementalModelSession | None = None
+
+    def open_incremental_session(
+        self,
+        config: WhisperObserverConfig,
+    ) -> ScriptedIncrementalModelSession:
+        self.open_calls.append(config)
+        self.session = ScriptedIncrementalModelSession(self.results)
+        return self.session
+
+
 def write_audio_fixture(path: Path) -> None:
     sample_rate_hz = 8_000
     samples = [
@@ -75,6 +115,37 @@ def write_audio_fixture(path: Path) -> None:
         audio.setsampwidth(2)
         audio.setframerate(sample_rate_hz)
         audio.writeframes(b"".join(struct.pack("<h", sample) for sample in samples))
+
+
+def write_incremental_whisper_fixture(
+    path: Path,
+    duration_seconds: float,
+    *,
+    sample_rate_hz: int = 10,
+) -> None:
+    frame_count = round(duration_seconds * sample_rate_hz)
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate_hz)
+        audio.writeframes(b"\x00\x00" * frame_count)
+
+
+def incremental_whisper_observer(
+    results: list[TranscriptionResult],
+    *,
+    prompt_max_characters: int = 1_000,
+):
+    backend = ScriptedIncrementalBackend(results)
+    observer = IncrementalWavWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+            prompt_max_characters=prompt_max_characters,
+        ),
+        backend,
+    )
+    return observer, backend
 
 
 def test_whisper_observer_emits_timestamped_speech_observations(
@@ -383,6 +454,358 @@ def test_unexpected_backend_failure_becomes_typed_error(tmp_path: Path) -> None:
         WhisperObserver(backend=BrokenBackend()).observe(
             ObserverContext(source_path=audio_path)
         )
+
+
+def test_incremental_whisper_rebases_chunk_timestamps_globally(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rebase.wav"
+    write_incremental_whisper_fixture(path, 7.0)
+    observer, _ = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(1.0, 2.0, "first")]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.5, 1.0, "second")]
+            ),
+        ]
+    )
+
+    observations = [
+        item for batch in observer.batches(path) for item in batch.observations
+    ]
+
+    assert [
+        (item.timestamp_seconds, item.duration_seconds, item.value["text"])
+        for item in observations
+    ] == [(1.0, 1.0, "first"), (3.5, 0.5, "second")]
+
+
+def test_incremental_whisper_core_accepts_transport_neutral_pcm() -> None:
+    core = IncrementalWhisperSessionCore(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+        )
+    )
+    chunk = IncrementalWhisperAudioChunk(
+        pcm_bytes=b"\x00\x00" * 40,
+        sample_rate_hz=10,
+        channels=1,
+        sample_width_bytes=2,
+        start_frame=0,
+        end_frame=40,
+        stable_through_frame=30,
+    )
+
+    batch = core.accept_chunk(
+        chunk,
+        TranscriptionResult(
+            segments=[TranscriptionSegment(1.0, 2.0, "transport neutral")]
+        ),
+    )
+    eof = core.flush(IncrementalWhisperEOF(final_frame=40, sample_rate_hz=10))
+
+    assert [item.value["text"] for item in batch.observations] == [
+        "transport neutral"
+    ]
+    assert batch.watermark_seconds == 3.0
+    assert eof is not None and eof.watermark_seconds == 4.0
+    assert core.flush(IncrementalWhisperEOF(40, 10)) is None
+
+
+def test_incremental_whisper_deduplicates_overlap_segments(tmp_path: Path) -> None:
+    path = tmp_path / "duplicates.wav"
+    write_incremental_whisper_fixture(path, 7.0)
+    observer, _ = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(3.2, 3.8, "  Same   phrase ")]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.2, 0.8, "same phrase")]
+            ),
+        ]
+    )
+
+    observations = [
+        item for batch in observer.batches(path) for item in batch.observations
+    ]
+
+    assert len(observations) == 1
+    assert observations[0].timestamp_seconds == 3.2
+    assert observations[0].value["text"] == "same phrase"
+
+
+@pytest.mark.parametrize(
+    ("first_text", "revised_text"),
+    [
+        ("Wait, what?", "wait what"),
+        ("hello world", "hello brave world"),
+    ],
+)
+def test_incremental_whisper_reconciles_near_duplicate_overlap_phrases(
+    tmp_path: Path,
+    first_text: str,
+    revised_text: str,
+) -> None:
+    path = tmp_path / "near-duplicates.wav"
+    write_incremental_whisper_fixture(path, 7.0)
+    observer, _ = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(3.2, 3.8, first_text)]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.2, 0.8, revised_text)]
+            ),
+        ]
+    )
+
+    observations = [
+        item for batch in observer.batches(path) for item in batch.observations
+    ]
+
+    assert len(observations) == 1
+    assert observations[0].value["text"] == revised_text
+
+
+def test_incremental_whisper_holds_right_edge_until_next_chunk(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "provisional.wav"
+    write_incremental_whisper_fixture(path, 7.0)
+    observer, _ = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(3.2, 3.8, "edge")]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.2, 0.8, "edge")]
+            ),
+        ]
+    )
+
+    with observer.session(path) as session:
+        first = session.read_batch()
+        second = session.read_batch()
+
+    assert first is not None and first.observations == ()
+    assert first.metadata["provisional_segment_count"] == 1
+    assert first.watermark_seconds <= 3.2
+    assert second is not None
+    assert [item.value["text"] for item in second.observations] == ["edge"]
+
+
+def test_incremental_whisper_watermarks_are_monotonic_and_clamped(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watermarks.wav"
+    write_incremental_whisper_fixture(path, 10.0)
+    observer, _ = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(3.1, 3.9, "one")]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(3.1, 3.9, "two")]
+            ),
+            TranscriptionResult(),
+        ]
+    )
+
+    batches = list(observer.batches(path))
+    watermarks = [batch.watermark_seconds for batch in batches]
+
+    assert watermarks == sorted(watermarks)
+    assert batches[0].watermark_seconds <= 3.1
+    assert batches[1].watermark_seconds <= 6.1
+    assert batches[-1].eof is True
+    assert batches[-1].watermark_seconds == 10.0
+
+
+def test_incremental_whisper_prompt_context_is_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "prompt.wav"
+    write_incremental_whisper_fixture(path, 10.0)
+    observer, backend = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.1, 0.5, "first sentence")]
+            ),
+            TranscriptionResult(
+                segments=[TranscriptionSegment(0.1, 0.5, "second sentence")]
+            ),
+            TranscriptionResult(),
+        ],
+        prompt_max_characters=12,
+    )
+
+    list(observer.batches(path))
+
+    assert backend.session is not None
+    prompts = [prompt for _, prompt in backend.session.calls]
+    assert prompts[0] is None
+    assert all(prompt is None or len(prompt) <= 12 for prompt in prompts)
+    assert prompts[1] == "rst sentence"
+    assert prompts[2] == "ond sentence"
+
+
+def test_incremental_whisper_loads_model_once_per_session(tmp_path: Path) -> None:
+    path = tmp_path / "model.wav"
+    write_incremental_whisper_fixture(path, 10.0)
+    observer, backend = incremental_whisper_observer(
+        [TranscriptionResult(), TranscriptionResult(), TranscriptionResult()]
+    )
+
+    list(observer.batches(path))
+
+    assert len(backend.open_calls) == 1
+    assert backend.session is not None
+    assert len(backend.session.calls) == 3
+    assert backend.session.close_calls == 1
+
+
+def test_incremental_whisper_retries_failed_chunk_without_skipping_or_duplication(
+    tmp_path: Path,
+) -> None:
+    class RetryModelSession:
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+
+        def transcribe(
+            self,
+            audio_path: Path,
+            initial_prompt: str | None,
+        ) -> TranscriptionResult:
+            with wave.open(str(audio_path), "rb") as audio:
+                self.calls.append(audio.getnframes() / audio.getframerate())
+            if len(self.calls) == 1:
+                raise TranscriptionError("temporary failure")
+            return TranscriptionResult(
+                segments=[TranscriptionSegment(1.0, 2.0, "retry once")]
+            )
+
+        def close(self) -> None:
+            pass
+
+    class RetryBackend:
+        def __init__(self) -> None:
+            self.session = RetryModelSession()
+
+        def open_incremental_session(self, config: WhisperObserverConfig):
+            return self.session
+
+    path = tmp_path / "retry.wav"
+    write_incremental_whisper_fixture(path, 4.0)
+    backend = RetryBackend()
+    observer = IncrementalWavWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+        ),
+        backend,
+    )
+
+    with observer.session(path) as session:
+        with pytest.raises(TranscriptionError, match="temporary failure"):
+            session.read_batch()
+        successful = session.read_batch()
+        eof = session.read_batch()
+
+    assert backend.session.calls == [4.0, 4.0]
+    assert successful is not None
+    assert [item.value["text"] for item in successful.observations] == [
+        "retry once"
+    ]
+    assert eof is not None and eof.observations == ()
+
+
+def test_openai_incremental_session_reuses_one_loaded_model(tmp_path: Path) -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.prompts: list[str | None] = []
+
+        def transcribe(self, path: str, **options: object) -> dict[str, object]:
+            self.calls += 1
+            prompt = options.get("initial_prompt")
+            self.prompts.append(prompt if isinstance(prompt, str) else None)
+            return {"text": "", "segments": []}
+
+    model = FakeModel()
+    load_calls = 0
+
+    def load_model(name: str, **options: object) -> FakeModel:
+        nonlocal load_calls
+        load_calls += 1
+        return model
+
+    module = ModuleType("whisper")
+    module.load_model = load_model  # type: ignore[attr-defined]
+    backend = OpenAIWhisperBackend(module_loader=lambda name: module)
+    path = tmp_path / "openai-session.wav"
+    write_incremental_whisper_fixture(path, 7.0)
+    observer = IncrementalWavWhisperObserver(
+        IncrementalWhisperObserverConfig(
+            chunk_seconds=4.0,
+            overlap_seconds=1.0,
+            prompt_max_characters=5,
+            analysis=WhisperObserverConfig(options={"initial_prompt": "unbounded"}),
+        ),
+        backend,
+    )
+
+    list(observer.batches(path))
+
+    assert load_calls == 1
+    assert model.calls == 2
+    assert model.prompts == [None, None]
+
+
+def test_incremental_whisper_flushes_provisional_at_eof_once(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "eof.wav"
+    write_incremental_whisper_fixture(path, 2.0)
+    observer, _ = incremental_whisper_observer(
+        [
+            TranscriptionResult(
+                segments=[TranscriptionSegment(1.5, 2.0, "final words")]
+            )
+        ]
+    )
+
+    with observer.session(path) as session:
+        first = session.read_batch()
+        eof = session.read_batch()
+        repeated = session.flush()
+
+    assert first is not None and first.observations == ()
+    assert eof is not None and eof.eof is True
+    assert [item.value["text"] for item in eof.observations] == ["final words"]
+    assert eof.watermark_seconds == 2.0
+    assert repeated is None
+
+
+def test_existing_whole_file_whisper_still_uses_single_full_source_call(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "whole.wav"
+    audio_path.write_bytes(b"fixture")
+    backend = FakeTranscriptionBackend(
+        TranscriptionResult(
+            segments=[TranscriptionSegment(0.0, 1.0, "whole file")]
+        )
+    )
+    config = WhisperObserverConfig()
+
+    result = WhisperObserver(config=config, backend=backend).observe(
+        ObserverContext(source_path=audio_path)
+    )
+
+    assert backend.calls == [(audio_path, config)]
+    assert [item.value["text"] for item in result.observations] == ["whole file"]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is not installed")

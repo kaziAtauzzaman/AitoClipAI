@@ -1,11 +1,27 @@
 """Whisper speech observer package."""
 
-from whisper_observer.backend import OpenAIWhisperBackend
-from whisper_observer.config import WhisperObserverConfig
+from whisper_observer.backend import OpenAIWhisperBackend, OpenAIWhisperModelSession
+from whisper_observer.config import (
+    IncrementalWhisperObserverConfig,
+    WhisperObserverConfig,
+)
 from whisper_observer.contracts import (
+    IncrementalTranscriptionBackend,
+    IncrementalTranscriptionSession,
+    IncrementalWhisperAudioChunk,
+    IncrementalWhisperBatch,
+    IncrementalWhisperEOF,
+    IncrementalWhisperLifecycle,
+    SegmentReconciliationPolicy,
     TranscriptionBackend,
     TranscriptionResult,
     TranscriptionSegment,
+)
+from whisper_observer.incremental import (
+    IncrementalWhisperSessionCore,
+    IncrementalWavWhisperObserver,
+    IncrementalWavWhisperSession,
+    TokenOverlapReconciliationPolicy,
 )
 from whisper_observer.errors import (
     InvalidTranscriptionError,
@@ -16,7 +32,20 @@ from whisper_observer.observer import WhisperObserver
 
 __all__ = [
     "InvalidTranscriptionError",
+    "IncrementalTranscriptionBackend",
+    "IncrementalTranscriptionSession",
+    "IncrementalWhisperAudioChunk",
+    "IncrementalWhisperBatch",
+    "IncrementalWhisperEOF",
+    "IncrementalWhisperLifecycle",
+    "IncrementalWhisperObserverConfig",
+    "IncrementalWhisperSessionCore",
+    "IncrementalWavWhisperObserver",
+    "IncrementalWavWhisperSession",
     "OpenAIWhisperBackend",
+    "OpenAIWhisperModelSession",
+    "SegmentReconciliationPolicy",
+    "TokenOverlapReconciliationPolicy",
     "TranscriptionBackend",
     "TranscriptionError",
     "TranscriptionResult",

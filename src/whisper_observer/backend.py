@@ -44,6 +44,16 @@ class OpenAIWhisperBackend:
 
         return self._normalize(raw)
 
+    def open_incremental_session(
+        self,
+        config: WhisperObserverConfig,
+    ) -> "OpenAIWhisperModelSession":
+        """Load one model handle for reuse across chronological chunks."""
+
+        whisper = self._load_whisper()
+        model = self._load_model(whisper, config)
+        return OpenAIWhisperModelSession(self, model, config)
+
     def _transcription_options(
         self,
         model: Any,
@@ -122,6 +132,40 @@ class OpenAIWhisperBackend:
             confidence=_optional_float(raw.get("confidence")),
             metadata=preserved,
         )
+
+
+class OpenAIWhisperModelSession:
+    """Reusable loaded-model handle for incremental chunk transcription."""
+
+    def __init__(
+        self,
+        backend: OpenAIWhisperBackend,
+        model: Any,
+        config: WhisperObserverConfig,
+    ) -> None:
+        self._backend = backend
+        self._model = model
+        self._config = config
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        initial_prompt: str | None,
+    ) -> TranscriptionResult:
+        options = self._backend._transcription_options(self._model, self._config)
+        options.pop("initial_prompt", None)
+        if self._config.language is not None:
+            options["language"] = self._config.language
+        if initial_prompt:
+            options["initial_prompt"] = initial_prompt
+        try:
+            raw = self._model.transcribe(str(audio_path), **options)
+        except Exception as exc:
+            raise TranscriptionError(f"Whisper transcription failed: {exc}") from exc
+        return self._backend._normalize(raw)
+
+    def close(self) -> None:
+        """The backend owns and may cache the loaded model."""
 
 
 def _optional_string(value: object) -> str | None:
