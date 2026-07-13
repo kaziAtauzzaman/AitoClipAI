@@ -311,6 +311,7 @@ class IncrementalWhisperSessionCore:
             **self._metadata,
             "chunk_index": self._chunk_index,
             "provisional_segment_count": len(self._pending),
+            "sample_rate_hz": self._sample_rate,
         }
         if eof:
             metadata["duration_seconds"] = self._watermark

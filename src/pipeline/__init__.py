@@ -31,6 +31,15 @@ from pipeline.incremental import (
 )
 from pipeline.persistence import JsonFeatureTimelineWriter, TimelineWriter
 from pipeline.prerecorded import PrerecordedPipelineConfig, PrerecordedVideoPipeline
+from pipeline.production_incremental import (
+    IncrementalFailure,
+    JsonProductionIncrementalReportWriter,
+    ProductionIncrementalLifecycle,
+    ProductionIncrementalOrchestrator,
+    ProductionIncrementalReport,
+    TimedObserverBatch,
+    TimedOperation,
+)
 from pipeline.validation import (
     ArtifactValidationConfig,
     ArtifactValidator,
@@ -72,6 +81,13 @@ __all__ = [
     "PrerecordedPipelineConfig",
     "PrerecordedPipelineResult",
     "PrerecordedVideoPipeline",
+    "ProductionIncrementalLifecycle",
+    "ProductionIncrementalOrchestrator",
+    "ProductionIncrementalReport",
+    "IncrementalFailure",
+    "JsonProductionIncrementalReportWriter",
+    "TimedObserverBatch",
+    "TimedOperation",
     "RenderedArtifactValidation",
     "RequiredObserverError",
     "TimelineWriter",

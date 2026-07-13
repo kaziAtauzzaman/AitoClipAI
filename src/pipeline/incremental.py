@@ -163,6 +163,17 @@ class IncrementalPrerecordedCoordinator:
 
         return self._config.required_observers
 
+    @property
+    def result(self) -> IncrementalPipelineResult:
+        """Return a snapshot of finalized coordinator output."""
+
+        return IncrementalPipelineResult(
+            scores=list(self._result.scores),
+            selected_scores=list(self._result.selected_scores),
+            suppressed=list(self._result.suppressed),
+            render_jobs=list(self._result.render_jobs),
+        )
+
     def render_state(self, score: ClipScore) -> RenderLifecycleState | None:
         return self._render_states.get(self._score_fingerprint(score))
 
