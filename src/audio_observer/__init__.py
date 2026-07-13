@@ -8,8 +8,12 @@ from audio_observer.analysis import (
     SilenceDetector,
     SpeakingIntensityAnalyzer,
 )
-from audio_observer.config import AudioObserverConfig, FFmpegAudioExtractorConfig
-from audio_observer.contracts import AudioData, AudioSource
+from audio_observer.config import (
+    AudioObserverConfig,
+    FFmpegAudioExtractorConfig,
+    IncrementalAudioObserverConfig,
+)
+from audio_observer.contracts import AudioData, AudioSource, IncrementalAudioBatch
 from audio_observer.errors import (
     AudioExtractionError,
     AudioObserverError,
@@ -24,6 +28,10 @@ from audio_observer.extraction import (
 )
 from audio_observer.loading import AudioLoader, WavAudioLoader
 from audio_observer.observer import AudioObserver
+from audio_observer.incremental import (
+    IncrementalWavAudioObserver,
+    IncrementalWavAudioSession,
+)
 from audio_observer.timestamping import TimestampGenerator
 
 __all__ = [
@@ -37,6 +45,10 @@ __all__ = [
     "AudioObserverConfig",
     "AudioObserverError",
     "AudioSource",
+    "IncrementalAudioBatch",
+    "IncrementalAudioObserverConfig",
+    "IncrementalWavAudioObserver",
+    "IncrementalWavAudioSession",
     "CommandRunner",
     "ContextAudioExtractor",
     "FFmpegAudioExtractor",

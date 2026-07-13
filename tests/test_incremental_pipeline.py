@@ -1,10 +1,18 @@
 from pathlib import Path
+import struct
 import subprocess
+import wave
 
 import pytest
 
+from aggregation import FeatureAggregator
+from audio_observer import (
+    AudioObserverConfig,
+    IncrementalAudioObserverConfig,
+    IncrementalWavAudioObserver,
+)
 from candidate_generation import CandidateGenerator
-from candidate_scoring import CandidateScorer
+from candidate_scoring import CandidateScorer, CandidateScoringConfig
 from candidate_selection import CandidateSelector
 from clip_rendering import ClipRenderer, ClipRendererConfig
 from core import (
@@ -137,6 +145,88 @@ def watermarks(value: float, observer: str = "fixture") -> ObserverWatermarks:
 
 def eof(value: float, observer: str = "fixture") -> IncrementalEOF:
     return IncrementalEOF(value, watermarks(value, observer))
+
+
+def _write_incremental_audio_fixture(path: Path) -> None:
+    samples = [0.45] * 8 + [0.95] + [0.45] * 21
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(10)
+        wav_file.writeframes(
+            b"".join(struct.pack("<h", round(sample * 32768)) for sample in samples)
+        )
+
+
+def test_real_incremental_audio_drives_coordinator_across_watermarks(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "audio.wav"
+    media_path = tmp_path / "source.mp4"
+    _write_incremental_audio_fixture(audio_path)
+    media_path.write_bytes(b"source")
+    observer = IncrementalWavAudioObserver(
+        IncrementalAudioObserverConfig(
+            chunk_frames=5,
+            analysis=AudioObserverConfig(
+                window_seconds=0.5,
+                hop_seconds=0.5,
+                peak_threshold=0.9,
+                min_peak_distance_seconds=0.3,
+                speaking_intensity_threshold_dbfs=-30.0,
+            ),
+        )
+    )
+    renderer = RecordingRenderer(tmp_path)
+    incremental = IncrementalPrerecordedCoordinator(
+        candidate_generator=CandidateGenerator(),
+        candidate_scorer=CandidateScorer(
+            CandidateScoringConfig(passing_score=0.0)
+        ),
+        candidate_selector=CandidateSelector(),
+        clip_renderer=renderer,
+        config=IncrementalPipelineConfig(required_observers=("audio",)),
+    )
+    accumulated = []
+    observed_watermarks = []
+
+    for batch in observer.batches(audio_path):
+        accumulated.extend(batch.observations)
+        result = ObserverResult(
+            observer="audio",
+            observations=list(accumulated),
+            metadata={
+                "sample_rate_hz": 10,
+                "duration_seconds": batch.frames_processed / 10,
+            },
+        )
+        timeline = FeatureTimeline(
+            media_path=media_path,
+            audio_path=audio_path,
+            timeline_path=tmp_path / "timeline.json",
+            timeline=FeatureAggregator().aggregate([result]),
+            metadata={"source_id": "incremental-audio-fixture"},
+        )
+        if not batch.eof:
+            incremental.advance(
+                timeline,
+                ObserverWatermarks({"audio": batch.watermark_seconds}),
+            )
+            observed_watermarks.append(incremental.watermark_seconds)
+        else:
+            completed = incremental.flush(
+                timeline,
+                IncrementalEOF(
+                    batch.watermark_seconds,
+                    ObserverWatermarks({"audio": batch.watermark_seconds}),
+                ),
+            )
+
+    assert len(set(observed_watermarks)) >= 3
+    assert observed_watermarks == sorted(observed_watermarks)
+    assert completed.selected_scores
+    assert len(completed.render_jobs) == len(renderer.calls)
+    assert incremental.lifecycle is CoordinatorLifecycle.FLUSHED
 
 
 def test_coordinator_uses_only_explicit_observer_watermark(tmp_path: Path) -> None:
