@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 import shutil
 import struct
@@ -84,7 +85,12 @@ def test_pipeline_analyzes_local_media_and_persists_timeline(tmp_path: Path) -> 
     assert timeline.source_url is None
     assert timeline.download is None
     assert timeline.failures == []
-    assert timeline.metadata == {"input_type": "local", "observer_count": 1}
+    expected_source_id = f"local:sha256:{hashlib.sha256(media_path.read_bytes()).hexdigest()}"
+    assert timeline.metadata == {
+        "input_type": "local",
+        "observer_count": 1,
+        "source_id": expected_source_id,
+    }
     assert [result.observer for result in timeline.timeline.observer_results] == [
         "audio"
     ]

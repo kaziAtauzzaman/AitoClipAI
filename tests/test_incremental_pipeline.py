@@ -3,6 +3,8 @@ import subprocess
 
 import pytest
 
+from candidate_generation import CandidateGenerator
+from candidate_scoring import CandidateScorer
 from candidate_selection import CandidateSelector
 from clip_rendering import ClipRenderer, ClipRendererConfig
 from core import (
@@ -18,6 +20,7 @@ from core import (
 from pipeline import (
     candidate_fingerprint,
     CompletedTimelineReplayAdapter,
+    CompletedTimelineReplayConfig,
     CoordinatorLifecycle,
     IncrementalEOF,
     IncrementalPipelineConfig,
@@ -311,6 +314,131 @@ def test_later_stronger_overlap_and_batch_selection_match(tmp_path: Path) -> Non
     assert {item.score.candidate.reason for item in result.suppressed} == {
         item.score.candidate.reason for item in batch.suppressed
     }
+
+
+def test_real_components_replay_matches_batch_after_multiple_watermarks(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "realistic-source.mp4"
+    source.write_bytes(b"fixture")
+
+    def audio_cluster(timestamp: float, intensity: float, peak: float):
+        return [
+            Observation(
+                timestamp - 2.0,
+                "audio",
+                "silence",
+                {"loudness_dbfs": -55.0},
+                duration_seconds=2.0,
+            ),
+            Observation(timestamp, "audio", "peak", {"amplitude": peak}),
+            Observation(
+                timestamp,
+                "audio",
+                "speaking_intensity",
+                {"intensity": intensity, "loudness_dbfs": -20.0},
+            ),
+        ]
+
+    audio = [
+        *audio_cluster(10.0, 0.80, 0.95),
+        *audio_cluster(12.1, 0.96, 0.99),
+        *audio_cluster(100.0, 0.85, 0.97),
+    ]
+    whisper = [
+        Observation(10.0, "whisper", "speech", {"text": "ordinary"}, confidence=0.75),
+        Observation(12.1, "whisper", "speech", {"text": "WOW!!!"}, confidence=0.75),
+        Observation(100.0, "whisper", "speech", {"text": "later"}, confidence=0.75),
+    ]
+    observer_results = [
+        ObserverResult("audio", audio, {"duration_seconds": 150.0}),
+        ObserverResult("whisper", whisper, {"duration_seconds": 150.0}),
+    ]
+    grouped: dict[float, list[Observation]] = {}
+    for result_item in observer_results:
+        for observation in result_item.observations:
+            grouped.setdefault(observation.timestamp_seconds, []).append(observation)
+    timeline = FeatureTimeline(
+        media_path=source,
+        audio_path=tmp_path / "audio.wav",
+        timeline_path=tmp_path / "timeline.json",
+        timeline=AggregatedTimeline(
+            groups=[
+                TimelineGroup(timestamp, grouped[timestamp])
+                for timestamp in sorted(grouped)
+            ],
+            observer_results=observer_results,
+        ),
+        metadata={"source_id": "fixture:real-components"},
+    )
+
+    batch_generator = CandidateGenerator()
+    batch_scorer = CandidateScorer()
+    batch_selector = CandidateSelector()
+    batch_scores = batch_scorer.score(batch_generator.generate(timeline))
+    batch_selection = batch_selector.select(
+        score for score in batch_scores if score.passed_threshold is True
+    )
+
+    class TrackingCoordinator(IncrementalPrerecordedCoordinator):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.advance_watermarks: list[float] = []
+
+        def advance(self, timeline, observer_watermarks):
+            self.advance_watermarks.append(
+                min(observer_watermarks.stable_through.values())
+            )
+            return super().advance(timeline, observer_watermarks)
+
+    renderer = RecordingRenderer(tmp_path)
+    incremental = TrackingCoordinator(
+        candidate_generator=CandidateGenerator(),
+        candidate_scorer=CandidateScorer(),
+        candidate_selector=CandidateSelector(),
+        clip_renderer=renderer,
+        config=IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+    )
+    replay = CompletedTimelineReplayAdapter(
+        CompletedTimelineReplayConfig(observation_batch_seconds=30.0)
+    )
+    result = replay.run(incremental, timeline, media_duration_seconds=150.0)
+
+    identity = lambda score: (
+        score.candidate.start_seconds,
+        score.candidate.end_seconds,
+    )
+    assert [identity(score) for score in result.scores] == [
+        identity(score) for score in batch_scores
+    ]
+    assert [score.overall_score for score in result.scores] == [
+        score.overall_score for score in batch_scores
+    ]
+    assert {identity(score) for score in result.selected_scores} == {
+        identity(score) for score in batch_selection.selected
+    }
+    incremental_suppressed = {
+        identity(item.score): (
+            identity(item.retained_score),
+            item.overlap_seconds,
+            item.overlap_ratio,
+            item.reason,
+        )
+        for item in result.suppressed
+    }
+    batch_suppressed = {
+        identity(item.score): (
+            identity(item.retained_score),
+            item.overlap_seconds,
+            item.overlap_ratio,
+            item.reason,
+        )
+        for item in batch_selection.suppressed
+    }
+    assert incremental_suppressed == batch_suppressed
+    assert incremental.advance_watermarks == [30.0, 60.0, 90.0, 120.0]
+    assert incremental.watermark_seconds == 150.0
+    assert incremental.required_observers == ("audio", "whisper")
 
 
 class CreatingRunner:

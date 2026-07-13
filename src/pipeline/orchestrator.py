@@ -1,6 +1,7 @@
 """End-to-end media analysis pipeline orchestration."""
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
@@ -71,6 +72,12 @@ class PipelineOrchestrator:
         )
         engine_result = self._observer_engine.run(observer_context)
         aggregated = self._aggregator.aggregate(engine_result.results)
+        timeline_metadata: dict[str, object] = {
+            "input_type": input_type,
+            "observer_count": engine_result.metadata.get("observer_count", 0),
+        }
+        if input_type == "local":
+            timeline_metadata["source_id"] = self._local_source_id(media_path)
         timeline = FeatureTimeline(
             media_path=media_path,
             audio_path=audio_source.path,
@@ -87,10 +94,7 @@ class PipelineOrchestrator:
                 )
                 for failure in engine_result.failures
             ],
-            metadata={
-                "input_type": input_type,
-                "observer_count": engine_result.metadata.get("observer_count", 0),
-            },
+            metadata=timeline_metadata,
         )
         written_path = self._timeline_writer.write(timeline)
         if written_path != timeline.timeline_path:
@@ -132,3 +136,18 @@ class PipelineOrchestrator:
         if self._config.timeline_dir is not None:
             return self._config.timeline_dir / filename
         return media_path.with_name(filename)
+
+    @staticmethod
+    def _local_source_id(media_path: Path) -> str:
+        """Return a portable content identity independent of the local path."""
+
+        digest = hashlib.sha256()
+        try:
+            with media_path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise PipelineError(
+                f"Failed to fingerprint local media: {media_path}: {exc}"
+            ) from exc
+        return f"local:sha256:{digest.hexdigest()}"

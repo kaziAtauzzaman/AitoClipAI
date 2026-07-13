@@ -157,6 +157,12 @@ class IncrementalPrerecordedCoordinator:
     def watermark_seconds(self) -> float:
         return self._watermark
 
+    @property
+    def required_observers(self) -> tuple[str, ...]:
+        """Return the immutable observer names required for safe progress."""
+
+        return self._config.required_observers
+
     def render_state(self, score: ClipScore) -> RenderLifecycleState | None:
         return self._render_states.get(self._score_fingerprint(score))
 
@@ -344,7 +350,11 @@ class IncrementalPrerecordedCoordinator:
 
 
 class CompletedTimelineReplayAdapter:
-    """Prototype adapter that derives stable watermarks using future knowledge."""
+    """Simulate incremental progress from a completed timeline.
+
+    This adapter intentionally inspects future observations. It exists only for
+    simulation and tests and must never be used as a real streaming observer.
+    """
 
     def __init__(self, config: CompletedTimelineReplayConfig | None = None) -> None:
         self._config = config or CompletedTimelineReplayConfig()
@@ -361,7 +371,10 @@ class CompletedTimelineReplayAdapter:
             coordinator.advance(_prefix_at(timeline, requested), watermarks)
             requested += self._config.observation_batch_seconds
         final = ObserverWatermarks(
-            {name: media_duration_seconds for name in coordinator._config.required_observers}
+            {
+                name: media_duration_seconds
+                for name in coordinator.required_observers
+            }
         )
         return coordinator.flush(
             timeline,
