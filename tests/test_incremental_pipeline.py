@@ -25,6 +25,7 @@ from core import (
     RenderJob,
     TimelineGroup,
 )
+from decision_engine import EditorialStrengthEvaluator
 from pipeline import (
     candidate_fingerprint,
     CompletedTimelineReplayAdapter,
@@ -671,6 +672,10 @@ def test_real_components_replay_matches_batch_after_multiple_watermarks(
     assert [score.overall_score for score in result.scores] == [
         score.overall_score for score in batch_scores
     ]
+    editorial = EditorialStrengthEvaluator()
+    assert editorial.evaluate(batch_scores, "fixture:real-components") == (
+        editorial.evaluate(result.scores, "fixture:real-components")
+    )
     assert {identity(score) for score in result.selected_scores} == {
         identity(score) for score in batch_selection.selected
     }

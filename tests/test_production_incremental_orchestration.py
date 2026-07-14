@@ -60,6 +60,60 @@ class MarkerScorer:
         ]
 
 
+class EditorialEvidenceGenerator:
+    maximum_backtrack_seconds = 0.0
+    incremental_deterministic = True
+
+    def generate(self, timeline):
+        valid = [
+            Observation(
+                1.0,
+                "audio",
+                "silence",
+                {"loudness_dbfs": -60.0},
+                duration_seconds=0.5,
+            ),
+            Observation(
+                1.5,
+                "audio",
+                "speaking_intensity",
+                {"loudness_dbfs": -20.0, "intensity": 0.8},
+                duration_seconds=0.5,
+            ),
+        ]
+        malformed = [
+            Observation(
+                4.0,
+                "audio",
+                "speaking_intensity",
+                {"loudness_dbfs": "invalid", "intensity": 0.8},
+                duration_seconds=1.0,
+            )
+        ]
+        return [
+            ClipCandidate(
+                timeline.media_path,
+                1.0,
+                2.0,
+                "valid editorial evidence",
+                metadata={
+                    "score": 0.8,
+                    "contributing_observations": valid,
+                },
+            ),
+            ClipCandidate(
+                timeline.media_path,
+                4.0,
+                5.0,
+                "malformed editorial evidence",
+                metadata={
+                    "score": 0.7,
+                    "contributing_observations": malformed,
+                },
+            ),
+        ]
+
+
 class Session:
     def __init__(self, batches, failure_at=None):
         self.batches = list(batches)
@@ -214,6 +268,37 @@ def test_combined_eof_flushes_overlap_winner_once(tmp_path):
     assert [item.candidate.reason for item in report.selected_scores] == ["strong"]
     assert [item.score.candidate.reason for item in report.suppressed] == ["weak"]
     assert len(report.render_jobs) == 1
+    assert report.editorial_strength_results == []
+    assert [item.code for item in report.editorial_strength_failures] == [
+        "insufficient_evidence",
+        "insufficient_evidence",
+    ]
+
+
+def test_editorial_failure_isolated_per_candidate_without_changing_decisions(
+    tmp_path,
+):
+    renderer = Renderer(tmp_path)
+    report = orchestrator(
+        tmp_path,
+        Session([audio_batch(6.0, eof=True)]),
+        Session([whisper_batch(6.0, eof=True)]),
+        renderer=renderer,
+        generator=EditorialEvidenceGenerator(),
+    ).run(*sources(tmp_path))
+
+    assert [item.candidate.reason for item in report.selected_scores] == [
+        "valid editorial evidence",
+        "malformed editorial evidence",
+    ]
+    assert len(renderer.calls) == 2
+    assert len(report.artifact_validations) == 2
+    assert len(report.editorial_strength_results) == 1
+    assert len(report.editorial_strength_failures) == 1
+    failure = report.editorial_strength_failures[0]
+    assert failure.code == "invalid_evidence"
+    assert failure.candidate_identity
+    assert report.status == "completed"
 
 
 def test_real_incremental_audio_and_deterministic_whisper_drive_orchestrator(tmp_path):

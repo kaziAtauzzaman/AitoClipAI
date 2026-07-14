@@ -24,6 +24,17 @@ from core import (
     RenderJob,
     TimelineGroup,
 )
+from decision_engine import (
+    EditorialStrengthEvaluator,
+    EditorialStrengthFailure,
+    EditorialStrengthResult,
+    InsufficientEditorialEvidenceError,
+)
+from decision_engine.editorial_strength import (
+    candidate_identity,
+    diagnostic_candidate_identity,
+)
+from decision_engine.errors import EditorialStrengthError
 from pipeline.contracts import RenderedArtifactValidation
 from pipeline.incremental import (
     IncrementalEOF,
@@ -104,6 +115,12 @@ class ProductionIncrementalReport:
     source_id: str | None = None
     observations: list[Observation] = field(default_factory=list)
     selected_scores: list[ClipScore] = field(default_factory=list)
+    editorial_strength_results: list[EditorialStrengthResult] = field(
+        default_factory=list
+    )
+    editorial_strength_failures: list[EditorialStrengthFailure] = field(
+        default_factory=list
+    )
     suppressed: list[SuppressedCandidate] = field(default_factory=list)
     render_jobs: list[RenderJob] = field(default_factory=list)
     render_failures: list[IncrementalFailure] = field(default_factory=list)
@@ -191,6 +208,7 @@ class ProductionIncrementalOrchestrator:
         candidate_generator=None,
         candidate_scorer=None,
         candidate_selector=None,
+        editorial_strength_evaluator=None,
         clock: Callable[[], float] = perf_counter,
     ) -> None:
         self._renderer = renderer
@@ -200,6 +218,9 @@ class ProductionIncrementalOrchestrator:
         self._generator = candidate_generator or CandidateGenerator()
         self._scorer = candidate_scorer or CandidateScorer()
         self._selector = candidate_selector or CandidateSelector()
+        self._editorial_strength = (
+            editorial_strength_evaluator or EditorialStrengthEvaluator()
+        )
         self._clock = clock
         self._lifecycle = ProductionIncrementalLifecycle.NEW
         self._validation_attempts: set[int] = set()
@@ -300,6 +321,10 @@ class ProductionIncrementalOrchestrator:
                 report.selected_scores = result.selected_scores
                 report.suppressed = result.suppressed
                 report.render_jobs = result.render_jobs
+                if report.source_id is not None:
+                    self._evaluate_editorial_strength(
+                        result.scores, report.source_id, report
+                    )
             report.total_wall_seconds = max(0.0, self._clock() - started)
             if self._lifecycle is ProductionIncrementalLifecycle.FINISHED:
                 report.status = (
@@ -310,6 +335,59 @@ class ProductionIncrementalOrchestrator:
             else:
                 report.status = "failed"
         return report
+
+    def _evaluate_editorial_strength(
+        self,
+        scores: list[ClipScore],
+        source_id: str,
+        report: ProductionIncrementalReport,
+    ) -> None:
+        formula_version = getattr(
+            self._editorial_strength,
+            "formula_version",
+            "editorial_strength_v1",
+        )
+        ordered = sorted(
+            scores,
+            key=lambda item: (
+                item.candidate.start_seconds,
+                item.candidate.end_seconds,
+                item.candidate.reason,
+            ),
+        )
+        for score in ordered:
+            try:
+                reference_identity = candidate_identity(
+                    score.candidate, source_id
+                )
+            except EditorialStrengthError:
+                reference_identity = diagnostic_candidate_identity(
+                    score.candidate, source_id
+                )
+            try:
+                report.editorial_strength_results.append(
+                    self._editorial_strength.evaluate_one(score, source_id)
+                )
+            except InsufficientEditorialEvidenceError as exc:
+                report.editorial_strength_failures.append(
+                    EditorialStrengthFailure(
+                        formula_version,
+                        reference_identity,
+                        "insufficient_evidence",
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                )
+            except Exception as exc:
+                report.editorial_strength_failures.append(
+                    EditorialStrengthFailure(
+                        formula_version,
+                        reference_identity,
+                        "invalid_evidence",
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                )
 
     def _read_batch(self, observer, session, sequence, report):
         started = self._clock()
