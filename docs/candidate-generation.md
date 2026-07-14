@@ -19,7 +19,7 @@ default core target is at most 30 seconds and is chosen from the strongest
 deterministic local concentration of existing contributions. Whisper speech,
 loudness, peaks, and injected signals drive boundaries. Speaking-intensity and
 silence-end events remain supporting evidence but cannot extend boundaries
-indefinitely. Contiguous events contributing at least `0.50` each may retain a
+indefinitely. Contiguous events with normalized strength of at least `0.80` may retain a
 longer core when they represent sustained high signal. Pre/post roll, minimum
 duration, media clamping, and the 60-second hard maximum are applied afterward.
 Sustained eligibility uses normalized event strength rather than weighted

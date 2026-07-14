@@ -318,6 +318,33 @@ def test_long_whisper_segment_is_framed_deterministically(tmp_path: Path) -> Non
     assert candidate.metadata["boundary_refinement"] == "strongest_local_contribution_core"
 
 
+def test_overlapping_fallback_whisper_chunks_do_not_restore_maximum_window(
+    tmp_path: Path,
+) -> None:
+    fallback_chunks = [
+        observation(
+            start,
+            "whisper",
+            "speech",
+            {"text": f"fallback {start}"},
+            duration=30.0,
+        )
+        for start in (10.0, 35.0)
+    ]
+
+    candidate = CandidateGenerator().generate(
+        feature_timeline(tmp_path, fallback_chunks, duration=80.0)
+    )[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == (8.0, 43.0)
+    assert candidate.end_seconds - candidate.start_seconds == 35.0
+    assert candidate.metadata["boundary_refinement"] == "strongest_local_contribution_core"
+    assert all(
+        item["sustained_strength"] == 0.75
+        for item in candidate.metadata["signal_contributions"]
+    )
+
+
 def test_silence_end_supports_anchor_without_retaining_full_silence(tmp_path: Path) -> None:
     silence = observation(5.0, "audio", "silence", {}, duration=20.0)
     speech = observation(25.0, "whisper", "speech", {"text": "after silence"}, duration=3.0, confidence=0.9)
@@ -494,8 +521,8 @@ def test_injected_event_must_explicitly_declare_boundary_role(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("confidence", "expected_reason"),
     [
-        (0.499, "strongest_local_contribution_core"),
-        (0.501, "sustained_high_signal_core"),
+        (0.799, "strongest_local_contribution_core"),
+        (0.801, "sustained_high_signal_core"),
     ],
 )
 def test_sustained_chain_uses_normalized_strength_threshold(

@@ -25,4 +25,4 @@ class CandidateGenerationConfig:
     minimum_clip_seconds: float = 8.0
     maximum_clip_seconds: float = 60.0
     anchor_core_seconds: float = 30.0
-    sustained_event_contribution: float = 0.50
+    sustained_event_contribution: float = 0.80
