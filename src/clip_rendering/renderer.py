@@ -142,6 +142,8 @@ class ClipRenderer:
             )
 
         output_path = self._output_path(score, rank)
+        temporary_path = self._temporary_output_path(output_path)
+        self._remove_temporary_output(temporary_path)
         if output_path.exists() and not self._config.overwrite_existing:
             return self._render_job(
                 score,
@@ -151,28 +153,47 @@ class ClipRenderer:
                 reused=True,
             )
 
-        command = self._build_command(
-            ffmpeg_path,
-            score,
-            output_path,
-            caption_artifact,
-        )
-        result = self._runner.run(command)
-        if result.returncode != 0:
-            diagnostic = result.stderr.strip() or result.stdout.strip()
-            detail = f": {diagnostic}" if diagnostic else ""
-            error_type = (
-                SubtitleRenderingError
-                if caption_artifact is not None
-                else ClipRenderingError
+        try:
+            command = self._build_command(
+                ffmpeg_path,
+                score,
+                temporary_path,
+                caption_artifact,
             )
-            raise error_type(
-                f"FFmpeg clip rendering failed with exit code {result.returncode}{detail}"
-            )
-        if not output_path.is_file():
-            raise ClipRenderingError(
-                f"FFmpeg completed without creating rendered clip: {output_path}"
-            )
+            result = self._runner.run(command)
+            if result.returncode != 0:
+                diagnostic = result.stderr.strip() or result.stdout.strip()
+                detail = f": {diagnostic}" if diagnostic else ""
+                error_type = (
+                    SubtitleRenderingError
+                    if caption_artifact is not None
+                    else ClipRenderingError
+                )
+                raise error_type(
+                    "FFmpeg clip rendering failed with exit code "
+                    f"{result.returncode}{detail}"
+                )
+            if not temporary_path.is_file():
+                raise ClipRenderingError(
+                    "FFmpeg completed without creating rendered clip: "
+                    f"{temporary_path}"
+                )
+            if output_path.exists() and not self._config.overwrite_existing:
+                return self._render_job(
+                    score,
+                    output_path,
+                    rank,
+                    caption_artifact,
+                    reused=True,
+                )
+            try:
+                temporary_path.replace(output_path)
+            except OSError as exc:
+                raise ClipRenderingError(
+                    f"Failed to promote rendered clip atomically: {exc}"
+                ) from exc
+        finally:
+            self._remove_temporary_output(temporary_path)
         return self._render_job(
             score,
             output_path,
@@ -180,6 +201,19 @@ class ClipRenderer:
             caption_artifact,
             reused=False,
         )
+
+    @staticmethod
+    def _temporary_output_path(output_path: Path) -> Path:
+        return output_path.with_name(f".{output_path.name}.rendering")
+
+    @staticmethod
+    def _remove_temporary_output(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ClipRenderingError(
+                f"Failed to clean temporary render output: {exc}"
+            ) from exc
 
     def _output_path(self, score: ClipScore, rank: int) -> Path:
         candidate = score.candidate
@@ -214,8 +248,12 @@ class ClipRenderer:
     ) -> list[str]:
         candidate = score.candidate
         start = f"{candidate.start_seconds:.6f}"
-        end = f"{candidate.end_seconds:.6f}"
-        video_filters = f"trim=start={start}:end={end},setpts=PTS-STARTPTS"
+        duration = f"{candidate.end_seconds - candidate.start_seconds:.6f}"
+        # FFmpeg rebases the primary input seek onto one shared timeline. Video
+        # is aligned to its first decoded frame for a zero-based output. Audio
+        # remains on the shared timeline; first_pts=0 fills any intentional
+        # positive delay with silence instead of collapsing the content offset.
+        video_filters = f"setpts=PTS-STARTPTS,trim=start=0:end={duration}"
         if caption_artifact is not None:
             escaped_path = escape_subtitle_filter_path(caption_artifact.path)
             character_encoding = escape_subtitle_filter_value(
@@ -226,7 +264,8 @@ class ClipRenderer:
             )
         filter_graph = (
             f"[0:v:0]{video_filters}[v];"
-            f"[0:a:0]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a]"
+            f"[0:a:0]atrim=start=0:end={duration},"
+            "aresample=async=1:first_pts=0[a]"
         )
         return [
             ffmpeg_path,
@@ -234,8 +273,14 @@ class ClipRenderer:
             "-loglevel",
             "error",
             "-y" if self._config.overwrite_existing else "-n",
+            # Input options apply to the next input only. Keep this seek grouped
+            # with the primary source when future secondary inputs are added.
+            "-ss",
+            start,
             "-i",
             str(candidate.source_video_path),
+            "-t",
+            duration,
             "-filter_complex",
             filter_graph,
             "-map",

@@ -114,8 +114,12 @@ def test_caption_renderer_adds_escaped_subtitle_filter_and_render_job_path(
     escaped = escape_subtitle_filter_path(captions.path)
     assert f"subtitles=filename='{escaped}':charenc='UTF-8'" in filter_graph
     assert filter_graph.startswith(
-        "[0:v:0]trim=start=2.500000:end=4.500000,setpts=PTS-STARTPTS,subtitles="
+        "[0:v:0]setpts=PTS-STARTPTS,trim=start=0:end=2.000000,subtitles="
     )
+    command = runner.commands[0]
+    assert command.index("-ss") < command.index("-i")
+    assert command[command.index("-ss") + 1] == "2.500000"
+    assert command[command.index("-t") + 1] == "2.000000"
     assert job.captions_path == captions.path
     assert job.metadata["subtitles_burned_in"] is True
 
