@@ -13,6 +13,7 @@ from candidate_generation import (
     CandidateGenerationConfig,
     CandidateGenerationError,
     CandidateGenerator,
+    EventBoundaryRole,
 )
 from core import FeatureTimeline, Observation, ObserverResult
 from observers import ObserverContext, ObserverEngine, ObserverRegistry
@@ -272,6 +273,279 @@ def test_generator_is_deterministic_for_observation_input_order(tmp_path: Path) 
     assert first[0].source_signals == second[0].source_signals
     assert first[0].reason == second[0].reason
     assert first[0].metadata["confidence"] == second[0].metadata["confidence"]
+    assert first[0].metadata == second[0].metadata
+
+
+def test_dense_supporting_audio_does_not_expand_to_maximum(tmp_path: Path) -> None:
+    items = [
+        observation(float(index), "audio", "speaking_intensity", {"intensity": 0.8}, duration=1.0)
+        for index in range(10, 66)
+    ]
+    candidates = CandidateGenerator().generate(
+        feature_timeline(tmp_path, items, duration=100.0)
+    )
+    candidate = candidates[0]
+
+    assert all(item.end_seconds - item.start_seconds < 60.0 for item in candidates)
+    assert (candidate.start_seconds, candidate.end_seconds) == (20.5, 55.5)
+    assert candidate.metadata["original_cluster_start"] == 10.0
+    assert candidate.metadata["original_cluster_end"] == 65.0
+    assert candidate.metadata["boundary_refinement"] == "supporting_event_anchor"
+
+
+def test_weak_supporting_events_cannot_extend_strong_speech_anchor(tmp_path: Path) -> None:
+    speech = observation(30.0, "whisper", "speech", {"text": "anchor"}, duration=5.0, confidence=0.9)
+    supporting = [
+        observation(float(index), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for index in range(10, 66)
+    ]
+    candidate = CandidateGenerator().generate(feature_timeline(tmp_path, [*supporting, speech], duration=100.0))[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == (28.0, 38.0)
+    assert candidate.metadata["anchor_core_start"] == 30.0
+    assert candidate.metadata["anchor_core_end"] == 35.0
+
+
+def test_long_whisper_segment_is_framed_deterministically(tmp_path: Path) -> None:
+    speech = observation(20.0, "whisper", "speech", {"text": "long anchor"}, duration=30.0, confidence=0.75)
+    trailing = [
+        observation(50.0 + index, "audio", "speaking_intensity", {"intensity": 0.5}, duration=1.0)
+        for index in range(20)
+    ]
+    candidate = CandidateGenerator().generate(feature_timeline(tmp_path, [speech, *trailing], duration=100.0))[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == (18.0, 53.0)
+    assert candidate.metadata["boundary_refinement"] == "strongest_local_contribution_core"
+
+
+def test_silence_end_supports_anchor_without_retaining_full_silence(tmp_path: Path) -> None:
+    silence = observation(5.0, "audio", "silence", {}, duration=20.0)
+    speech = observation(25.0, "whisper", "speech", {"text": "after silence"}, duration=3.0, confidence=0.9)
+    trailing = [
+        observation(float(index), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for index in range(28, 61)
+    ]
+    candidate = CandidateGenerator().generate(feature_timeline(tmp_path, [silence, speech, *trailing], duration=80.0))[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == (23.0, 31.0)
+    assert silence in candidate.metadata["contributing_observations"]
+    assert candidate.start_seconds > silence.timestamp_seconds
+
+
+def test_sustained_high_signal_may_exceed_anchor_target(tmp_path: Path) -> None:
+    sustained = [
+        observation(start, "whisper", "speech", {"text": f"strong {start}"}, duration=15.0, confidence=1.0)
+        for start in (10.0, 25.0, 40.0)
+    ]
+    candidate = CandidateGenerator().generate(feature_timeline(tmp_path, sustained, duration=80.0))[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == (8.0, 58.0)
+    assert candidate.end_seconds - candidate.start_seconds > 35.0
+    assert candidate.metadata["boundary_refinement"] == "sustained_high_signal_core"
+
+
+def test_retained_observations_intersect_refined_window(tmp_path: Path) -> None:
+    outside = observation(10.0, "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+    anchor = observation(40.0, "whisper", "speech", {"text": "anchor"}, duration=4.0, confidence=0.9)
+    bridge = [
+        observation(float(index), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for index in range(11, 40)
+    ]
+    candidate = CandidateGenerator().generate(feature_timeline(tmp_path, [outside, *bridge, anchor], duration=80.0))[0]
+
+    retained = candidate.metadata["contributing_observations"]
+    assert outside not in retained
+    assert all(
+        item.timestamp_seconds + (item.duration_seconds or 0.0) >= candidate.start_seconds
+        and item.timestamp_seconds <= candidate.end_seconds
+        for item in retained
+    )
+
+
+def test_equal_supporting_concentrations_prefer_central_then_earliest(tmp_path: Path) -> None:
+    items = [
+        observation(float(timestamp), "audio", "speaking_intensity", {"intensity": 0.8}, duration=1.0)
+        for timestamp in (*range(10, 16), *range(35, 41), *range(60, 66))
+    ]
+    bridge = [
+        observation(float(timestamp), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for timestamp in (*range(16, 35), *range(41, 60))
+    ]
+    config = CandidateGenerationConfig(maximum_clip_seconds=90.0, anchor_core_seconds=10.0)
+
+    candidate = CandidateGenerator(config).generate(
+        feature_timeline(tmp_path, [*items, *bridge], duration=90.0)
+    )[0]
+
+    assert candidate.metadata["anchor_core_start"] == 32.5
+    assert candidate.metadata["anchor_core_end"] == 42.5
+
+
+def test_short_strong_event_beats_one_long_weak_whisper_segment(tmp_path: Path) -> None:
+    long_weak = observation(
+        5.0, "whisper", "speech", {"text": "long weak"}, duration=35.0, confidence=0.51
+    )
+    short_strong = observation(
+        42.0, "whisper", "speech", {"text": "short strong"}, duration=2.0, confidence=0.95
+    )
+    bridge = [
+        observation(float(timestamp), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for timestamp in (40, 41)
+    ]
+    config = CandidateGenerationConfig(anchor_core_seconds=10.0)
+
+    candidate = CandidateGenerator(config).generate(
+        feature_timeline(tmp_path, [long_weak, *bridge, short_strong], duration=70.0)
+    )[0]
+
+    assert (candidate.metadata["anchor_core_start"], candidate.metadata["anchor_core_end"]) == (42.0, 44.0)
+    assert candidate.metadata["boundary_refinement"] == "strongest_local_contribution_core"
+
+
+def test_retained_metadata_and_confidence_are_internally_consistent(tmp_path: Path) -> None:
+    outside = observation(10.0, "audio", "speaking_intensity", {"intensity": 1.0}, duration=1.0)
+    bridge = [
+        observation(float(timestamp), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for timestamp in range(11, 40)
+    ]
+    anchor = observation(40.0, "whisper", "speech", {"text": "anchor"}, duration=2.0, confidence=0.8)
+
+    candidate = CandidateGenerator().generate(
+        feature_timeline(tmp_path, [outside, *bridge, anchor], duration=70.0)
+    )[0]
+    contributions = candidate.metadata["signal_contributions"]
+    retained = candidate.metadata["contributing_observations"]
+
+    assert outside not in retained
+    assert candidate.source_signals == list(dict.fromkeys(item["signal"] for item in contributions))
+    assert candidate.metadata["confidence"] == round(
+        min(1.0, sum(item["contribution"] for item in contributions)), 6
+    )
+    assert candidate.metadata["original_cluster_confidence"] > candidate.metadata["confidence"]
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "duration", "media_duration", "expected"),
+    [
+        (0.0, 1.0, 100.0, (0.0, 8.0)),
+        (98.0, 2.0, 100.0, (92.0, 100.0)),
+    ],
+)
+def test_refinement_and_minimum_expansion_preserve_media_edge_anchor(
+    tmp_path: Path,
+    timestamp: float,
+    duration: float,
+    media_duration: float,
+    expected: tuple[float, float],
+) -> None:
+    speech = observation(
+        timestamp, "whisper", "speech", {"text": "edge"}, duration=duration, confidence=1.0
+    )
+    support_range = range(1, 36) if timestamp == 0.0 else range(64, 98)
+    supporting = [
+        observation(float(second), "audio", "speaking_intensity", {"intensity": 0.4}, duration=1.0)
+        for second in support_range
+    ]
+
+    candidate = CandidateGenerator().generate(
+        feature_timeline(tmp_path, [speech, *supporting], duration=media_duration)
+    )[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == expected
+    assert candidate.start_seconds <= timestamp <= candidate.end_seconds
+    assert candidate.metadata["boundary_refinement"] == "strongest_local_contribution_core"
+
+
+def test_injected_event_must_explicitly_declare_boundary_role(tmp_path: Path) -> None:
+    class CustomHeuristic:
+        def detect(self, item: Observation) -> CandidateEvent | None:
+            if item.type == "routine":
+                return CandidateEvent(
+                    item.timestamp_seconds,
+                    item.timestamp_seconds + (item.duration_seconds or 0.0),
+                    "custom_routine",
+                    1.0,
+                    10.0,
+                    item,
+                )
+            if item.type == "anchor":
+                return CandidateEvent(
+                    item.timestamp_seconds,
+                    item.timestamp_seconds + (item.duration_seconds or 0.0),
+                    "custom_anchor",
+                    0.8,
+                    0.5,
+                    item,
+                    boundary_role=EventBoundaryRole.DRIVING,
+                    sustained_strength=0.8,
+                )
+            return None
+
+    routine = observation(5.0, "custom", "routine", {}, duration=35.0)
+    anchor = observation(42.0, "custom", "anchor", {}, duration=2.0)
+    candidate = CandidateGenerator(heuristics=[CustomHeuristic()]).generate(
+        feature_timeline(tmp_path, [routine, anchor], duration=70.0)
+    )[0]
+
+    assert candidate.metadata["anchor_core_start"] == 42.0
+    assert candidate.metadata["anchor_core_end"] == 44.0
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expected_reason"),
+    [
+        (0.499, "strongest_local_contribution_core"),
+        (0.501, "sustained_high_signal_core"),
+    ],
+)
+def test_sustained_chain_uses_normalized_strength_threshold(
+    tmp_path: Path,
+    confidence: float,
+    expected_reason: str,
+) -> None:
+    events = [
+        observation(start, "whisper", "speech", {"text": str(start)}, duration=16.0, confidence=confidence)
+        for start in (5.0, 21.0, 37.0)
+    ]
+
+    candidate = CandidateGenerator().generate(
+        feature_timeline(tmp_path, events, duration=70.0)
+    )[0]
+
+    assert candidate.metadata["boundary_refinement"] == expected_reason
+
+
+def test_dense_anchor_search_has_quadratic_operation_bound(tmp_path: Path) -> None:
+    class CountingGenerator(CandidateGenerator):
+        role_checks = 0
+
+        @staticmethod
+        def _is_boundary_driving(event: CandidateEvent) -> bool:
+            CountingGenerator.role_checks += 1
+            return CandidateGenerator._is_boundary_driving(event)
+
+    events = [
+        observation(index / 10.0, "whisper", "speech", {"text": str(index)}, duration=0.2, confidence=0.49)
+        for index in range(300)
+    ]
+    generator = CountingGenerator()
+
+    assert generator.generate(feature_timeline(tmp_path, events, duration=40.0))
+    assert CountingGenerator.role_checks <= len(events) ** 2 + len(events) * 5
+
+
+def test_short_cluster_preserves_legacy_boundaries_signals_and_confidence(tmp_path: Path) -> None:
+    speech = observation(10.0, "whisper", "speech", {"text": "short"}, duration=2.0, confidence=0.9)
+    intensity = observation(11.0, "audio", "speaking_intensity", {"intensity": 0.8}, duration=1.0)
+
+    candidate = CandidateGenerator().generate(
+        feature_timeline(tmp_path, [speech, intensity], duration=30.0)
+    )[0]
+
+    assert (candidate.start_seconds, candidate.end_seconds) == (7.5, 15.5)
+    assert candidate.source_signals == ["whisper_speech", "speaking_intensity"]
+    assert candidate.metadata["confidence"] == 0.82
+    assert candidate.metadata["boundary_refinement"] == "cluster_within_anchor_target"
 
 
 def test_generator_accepts_injected_heuristics(tmp_path: Path) -> None:

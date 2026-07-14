@@ -1,10 +1,19 @@
 """Injectable observation heuristics for candidate generation."""
 
 from dataclasses import dataclass
+from enum import Enum
+import math
 from typing import Protocol
 
 from core import Observation
 from candidate_generation.config import CandidateGenerationConfig
+
+
+class EventBoundaryRole(str, Enum):
+    """Declare whether an event may determine refined candidate boundaries."""
+
+    SUPPORTING = "supporting"
+    DRIVING = "driving"
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +26,19 @@ class CandidateEvent:
     strength: float
     weight: float
     observation: Observation
+    boundary_role: EventBoundaryRole = EventBoundaryRole.SUPPORTING
+    sustained_strength: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boundary_role, EventBoundaryRole):
+            raise ValueError("Candidate event boundary_role must be an EventBoundaryRole.")
+        if (
+            not math.isfinite(self.sustained_strength)
+            or not 0.0 <= self.sustained_strength <= 1.0
+        ):
+            raise ValueError(
+                "Candidate event sustained_strength must be finite and between zero and one."
+            )
 
     @property
     def contribution(self) -> float:
@@ -50,6 +72,8 @@ class WhisperSpeechHeuristic:
             signal="whisper_speech",
             strength=confidence,
             weight=self._config.speech_weight,
+            boundary_role=EventBoundaryRole.DRIVING,
+            sustained_strength=confidence,
         )
 
 
@@ -75,6 +99,8 @@ class AudioLoudnessHeuristic:
                 signal="audio_loudness",
                 strength=strength,
                 weight=self._config.loudness_weight,
+                boundary_role=EventBoundaryRole.DRIVING,
+                sustained_strength=strength,
             )
         if observation.type == "peak":
             amplitude = _number(observation.value.get("amplitude"))
@@ -85,6 +111,8 @@ class AudioLoudnessHeuristic:
                 signal="audio_peak",
                 strength=_clamp(amplitude),
                 weight=self._config.peak_weight,
+                boundary_role=EventBoundaryRole.DRIVING,
+                sustained_strength=_clamp(amplitude),
             )
         return None
 
@@ -155,6 +183,8 @@ def _event(
     signal: str,
     strength: float,
     weight: float,
+    boundary_role: EventBoundaryRole = EventBoundaryRole.SUPPORTING,
+    sustained_strength: float = 0.0,
 ) -> CandidateEvent:
     duration = max(0.0, observation.duration_seconds or 0.0)
     return CandidateEvent(
@@ -164,6 +194,8 @@ def _event(
         strength=_clamp(strength),
         weight=weight,
         observation=observation,
+        boundary_role=boundary_role,
+        sustained_strength=_clamp(sustained_strength),
     )
 
 
@@ -173,6 +205,8 @@ def _point_event(
     signal: str,
     strength: float,
     weight: float,
+    boundary_role: EventBoundaryRole = EventBoundaryRole.SUPPORTING,
+    sustained_strength: float = 0.0,
 ) -> CandidateEvent:
     return CandidateEvent(
         start_seconds=observation.timestamp_seconds,
@@ -181,6 +215,8 @@ def _point_event(
         strength=_clamp(strength),
         weight=weight,
         observation=observation,
+        boundary_role=boundary_role,
+        sustained_strength=_clamp(sustained_strength),
     )
 
 

@@ -586,6 +586,16 @@ def test_real_components_replay_matches_batch_after_multiple_watermarks(
     audio = [
         *audio_cluster(10.0, 0.80, 0.95),
         *audio_cluster(12.1, 0.96, 0.99),
+        *[
+            Observation(
+                float(timestamp),
+                "audio",
+                "speaking_intensity",
+                {"intensity": 0.40, "loudness_dbfs": -30.0},
+                duration_seconds=1.0,
+            )
+            for timestamp in range(13, 66)
+        ],
         *audio_cluster(100.0, 0.85, 0.97),
     ]
     whisper = [
@@ -619,6 +629,10 @@ def test_real_components_replay_matches_batch_after_multiple_watermarks(
     batch_scorer = CandidateScorer()
     batch_selector = CandidateSelector()
     batch_scores = batch_scorer.score(batch_generator.generate(timeline))
+    assert all(
+        score.candidate.end_seconds - score.candidate.start_seconds < 60.0
+        for score in batch_scores
+    )
     batch_selection = batch_selector.select(
         score for score in batch_scores if score.passed_threshold is True
     )
