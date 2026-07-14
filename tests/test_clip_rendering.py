@@ -12,8 +12,11 @@ from clip_rendering import (
     ClipRenderer,
     ClipRendererConfig,
     ClipRenderingError,
+    IntelQSVUnavailableError,
     InvalidRenderInputError,
+    RendererBackend,
     RenderingFFmpegNotFoundError,
+    SubtitleRenderingError,
 )
 from core import ClipCandidate, ClipScore, RenderJob
 
@@ -141,6 +144,214 @@ def test_renderer_builds_synchronized_filter_and_configured_encoding_command(
     assert command[command.index("-f") + 1] == "matroska"
     assert "-shortest" in command
     assert Path(command[-1]).name == f".{job.output_path.name}.rendering"
+
+
+def test_intel_qsv_backend_is_opt_in_and_part_of_output_identity(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            overwrite_existing=True,
+            renderer_backend=RendererBackend.INTEL_QSV,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+        qsv_capability_checker=lambda binary: True,
+    )
+
+    job = renderer.render_one(scored_candidate(source_path, 2.5, 7.75, 0.8), 4)
+
+    command = runner.commands[0]
+    assert command.index("-ss") < command.index("-i")
+    assert command[command.index("-t") + 1] == "5.250000"
+    assert command[command.index("-c:v") + 1] == "h264_qsv"
+    assert command[command.index("-c:a") + 1] == "aac"
+    assert command[command.index("-global_quality") + 1] == "23"
+    assert job.output_path.name.endswith(".intel_qsv.mp4")
+    assert job.metadata["renderer_backend"] == "intel_qsv"
+    assert job.metadata["video_codec"] == "h264_qsv"
+
+
+def test_software_backend_remains_default_with_unchanged_identity(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(output_dir=tmp_path / "clips", overwrite_existing=True),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+
+    job = renderer.render_one(scored_candidate(source_path, 1.0, 2.0, 0.8), 1)
+
+    assert runner.commands[0][runner.commands[0].index("-c:v") + 1] == "libx264"
+    assert job.output_path.name == "source.clip-001-1000-2000-800000.mp4"
+    assert job.metadata["renderer_backend"] == "software"
+
+
+def test_intel_qsv_request_fails_explicitly_without_encoder(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            renderer_backend=RendererBackend.INTEL_QSV,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+        qsv_capability_checker=lambda binary: False,
+    )
+
+    with pytest.raises(IntelQSVUnavailableError, match="initialization"):
+        renderer.render_one(scored_candidate(source_path, 1.0, 2.0, 0.8), 1)
+
+    assert runner.commands == []
+
+
+def test_intel_qsv_runtime_failure_does_not_fallback_or_leave_partial_output(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    runner = FakeRenderRunner(
+        returncode=1,
+        stderr="Error creating a MFX session: unsupported",
+        create_output=True,
+    )
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            renderer_backend=RendererBackend.INTEL_QSV,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+        qsv_capability_checker=lambda binary: True,
+    )
+
+    with pytest.raises(IntelQSVUnavailableError, match="MFX session"):
+        renderer.render_one(scored_candidate(source_path, 1.0, 2.0, 0.8), 1)
+
+    assert len(runner.commands) == 1
+    assert runner.commands[0][runner.commands[0].index("-c:v") + 1] == "h264_qsv"
+    final_path = tmp_path / "clips" / (
+        "source.clip-001-1000-2000-800000.intel_qsv.mp4"
+    )
+    assert not final_path.exists()
+    assert not final_path.with_name(f".{final_path.name}.rendering").exists()
+
+    runner.returncode = 0
+    runner.stderr = ""
+    job = renderer.render_one(scored_candidate(source_path, 1.0, 2.0, 0.8), 1)
+
+    assert runner.commands[1] == runner.commands[0]
+    assert job.output_path == final_path
+    assert final_path.is_file()
+
+
+def test_qsv_subtitle_and_general_failures_keep_specific_error_types(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    caption_path = tmp_path / "caption.srt"
+    caption_path.write_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nCaption\n", encoding="utf-8"
+    )
+    from captioning import CaptionArtifact
+
+    clip_score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    captions = CaptionArtifact(candidate=clip_score.candidate, path=caption_path)
+    runner = FakeRenderRunner(
+        returncode=1,
+        stderr="No such filter: subtitles",
+        create_output=False,
+    )
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            renderer_backend=RendererBackend.INTEL_QSV,
+            burn_subtitles=True,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+        qsv_capability_checker=lambda binary: True,
+    )
+
+    with pytest.raises(SubtitleRenderingError, match="No such filter"):
+        renderer.render([clip_score], [captions])
+
+    runner.stderr = "Could not write header: invalid argument"
+    with pytest.raises(ClipRenderingError, match="Could not write header") as caught:
+        renderer.render([clip_score], [captions])
+    assert not isinstance(caught.value, IntelQSVUnavailableError)
+
+
+def test_successful_qsv_runtime_preflight_is_cached_per_ffmpeg_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ffmpeg_path = str(tmp_path / "unique-ffmpeg.exe")
+    preflight_commands: list[list[str]] = []
+
+    def successful_preflight(command, **kwargs):
+        preflight_commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", successful_preflight)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    config = ClipRendererConfig(
+        output_dir=tmp_path / "clips",
+        renderer_backend=RendererBackend.INTEL_QSV,
+        overwrite_existing=True,
+    )
+    clip_score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    for identity in (1, 2):
+        ClipRenderer(
+            config,
+            runner=FakeRenderRunner(),
+            executable_locator=lambda binary: ffmpeg_path,
+        ).render_one(clip_score, identity)
+
+    assert len(preflight_commands) == 1
+    command = preflight_commands[0]
+    assert command[command.index("-c:v") + 1] == "h264_qsv"
+    assert command[command.index("-frames:v") + 1] == "1"
+
+
+def test_qsv_cache_reuse_uses_backend_specific_final_path(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    output_dir = tmp_path / "clips"
+    output_dir.mkdir()
+    output_path = output_dir / (
+        "source.clip-001-1000-2000-800000.intel_qsv.mp4"
+    )
+    output_path.write_bytes(b"valid cached qsv artifact")
+    temporary_path = output_path.with_name(f".{output_path.name}.rendering")
+    temporary_path.write_bytes(b"stale partial")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=output_dir,
+            renderer_backend=RendererBackend.INTEL_QSV,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+        qsv_capability_checker=lambda binary: True,
+    )
+
+    job = renderer.render_one(scored_candidate(source_path, 1.0, 2.0, 0.8), 1)
+
+    assert job.output_path == output_path
+    assert job.metadata["reused_existing"] is True
+    assert runner.commands == []
+    assert not temporary_path.exists()
 
 
 def test_renderer_reuses_deterministic_output_when_overwrite_is_disabled(

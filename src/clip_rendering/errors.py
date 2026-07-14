@@ -15,3 +15,7 @@ class InvalidRenderInputError(ClipRenderingError):
 
 class SubtitleRenderingError(ClipRenderingError):
     """Raised when caption association or FFmpeg subtitle rendering fails."""
+
+
+class IntelQSVUnavailableError(ClipRenderingError):
+    """Raised when the explicitly requested Intel QSV backend is unavailable."""

@@ -2,6 +2,7 @@
 
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, Iterable, Protocol, Sequence
 
@@ -10,10 +11,11 @@ from captioning import (
     CandidateCaptionIdentity,
     candidate_caption_identity,
 )
-from clip_rendering.config import ClipRendererConfig
+from clip_rendering.config import ClipRendererConfig, RendererBackend
 from clip_rendering.errors import (
     ClipRenderingError,
     InvalidRenderInputError,
+    IntelQSVUnavailableError,
     RenderingFFmpegNotFoundError,
     SubtitleRenderingError,
 )
@@ -45,15 +47,22 @@ class SubprocessRenderCommandRunner:
 class ClipRenderer:
     """Render the highest-scoring candidates from their original source media."""
 
+    _qsv_preflight_successes: set[str] = set()
+    _qsv_preflight_lock = threading.Lock()
+
     def __init__(
         self,
         config: ClipRendererConfig | None = None,
         runner: RenderCommandRunner | None = None,
         executable_locator: Callable[[str], str | None] | None = None,
+        qsv_capability_checker: Callable[[str], bool] | None = None,
     ) -> None:
         self._config = config or ClipRendererConfig()
         self._runner = runner or SubprocessRenderCommandRunner()
         self._executable_locator = executable_locator or shutil.which
+        self._qsv_capability_checker = (
+            qsv_capability_checker or self._runtime_qsv_preflight
+        )
         self._validate_config()
 
     def render(
@@ -75,6 +84,7 @@ class ClipRenderer:
             raise RenderingFFmpegNotFoundError(
                 f"FFmpeg executable was not found: {self._config.ffmpeg_binary!r}."
             )
+        self._require_requested_backend(ffmpeg_path)
 
         try:
             self._config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +123,7 @@ class ClipRenderer:
             raise RenderingFFmpegNotFoundError(
                 f"FFmpeg executable was not found: {self._config.ffmpeg_binary!r}."
             )
+        self._require_requested_backend(ffmpeg_path)
         try:
             self._config.output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -164,9 +175,18 @@ class ClipRenderer:
             if result.returncode != 0:
                 diagnostic = result.stderr.strip() or result.stdout.strip()
                 detail = f": {diagnostic}" if diagnostic else ""
+                if (
+                    self._config.renderer_backend is RendererBackend.INTEL_QSV
+                    and self._is_qsv_initialization_failure(diagnostic)
+                ):
+                    raise IntelQSVUnavailableError(
+                        "Intel QSV device, driver, session, or encoder "
+                        f"initialization failed{detail}"
+                    )
                 error_type = (
                     SubtitleRenderingError
                     if caption_artifact is not None
+                    and self._is_subtitle_failure(diagnostic)
                     else ClipRenderingError
                 )
                 raise error_type(
@@ -237,6 +257,9 @@ class ClipRenderer:
             raise InvalidRenderInputError(
                 "Clip filename template must produce one non-empty filename."
             )
+        if self._config.renderer_backend is RendererBackend.INTEL_QSV:
+            path = Path(filename)
+            filename = f"{path.stem}.intel_qsv{path.suffix}"
         return self._config.output_dir / filename
 
     def _build_command(
@@ -267,7 +290,12 @@ class ClipRenderer:
             f"[0:a:0]atrim=start=0:end={duration},"
             "aresample=async=1:first_pts=0[a]"
         )
-        return [
+        video_codec = (
+            "h264_qsv"
+            if self._config.renderer_backend is RendererBackend.INTEL_QSV
+            else self._config.video_codec
+        )
+        command = [
             ffmpeg_path,
             "-hide_banner",
             "-loglevel",
@@ -288,7 +316,7 @@ class ClipRenderer:
             "-map",
             "[a]",
             "-c:v",
-            self._config.video_codec,
+            video_codec,
             "-c:a",
             self._config.audio_codec,
             "-map_metadata",
@@ -300,6 +328,15 @@ class ClipRenderer:
             self._normalized_output_format(),
             str(output_path),
         ]
+        if self._config.renderer_backend is RendererBackend.INTEL_QSV:
+            codec_index = command.index("-c:v") + 2
+            command[codec_index:codec_index] = [
+                "-preset",
+                "medium",
+                "-global_quality",
+                "23",
+            ]
+        return command
 
     def _render_job(
         self,
@@ -326,7 +363,12 @@ class ClipRenderer:
                 "end_seconds": candidate.end_seconds,
                 "duration_seconds": candidate.end_seconds - candidate.start_seconds,
                 "output_format": self._normalized_output_format(),
-                "video_codec": self._config.video_codec,
+                "video_codec": (
+                    "h264_qsv"
+                    if self._config.renderer_backend is RendererBackend.INTEL_QSV
+                    else self._config.video_codec
+                ),
+                "renderer_backend": self._config.renderer_backend.value,
                 "audio_codec": self._config.audio_codec,
                 "reused_existing": reused,
                 "subtitles_burned_in": caption_artifact is not None,
@@ -374,6 +416,10 @@ class ClipRenderer:
 
     def _validate_config(self) -> None:
         config = self._config
+        if not isinstance(config.renderer_backend, RendererBackend):
+            raise InvalidRenderInputError(
+                "Renderer backend must be a RendererBackend value."
+            )
         if config.maximum_clips is not None and config.maximum_clips <= 0:
             raise InvalidRenderInputError("Maximum clips must be positive or None.")
         if not config.output_format.removeprefix("."):
@@ -384,6 +430,96 @@ class ClipRenderer:
             raise InvalidRenderInputError(
                 "Subtitle character encoding cannot be empty."
             )
+
+    def _require_requested_backend(self, ffmpeg_path: str) -> None:
+        if (
+            self._config.renderer_backend is RendererBackend.INTEL_QSV
+            and not self._qsv_capability_checker(ffmpeg_path)
+        ):
+            raise IntelQSVUnavailableError(
+                "Intel QSV device, driver, session, or encoder initialization failed."
+            )
+
+    @classmethod
+    def _runtime_qsv_preflight(cls, ffmpeg_path: str) -> bool:
+        cache_key = str(Path(ffmpeg_path).resolve(strict=False)).casefold()
+        with cls._qsv_preflight_lock:
+            if cache_key in cls._qsv_preflight_successes:
+                return True
+            command = [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:size=64x64:rate=1:duration=1",
+                "-frames:v",
+                "1",
+                "-an",
+                "-c:v",
+                "h264_qsv",
+                "-preset",
+                "medium",
+                "-global_quality",
+                "23",
+                "-f",
+                "null",
+                "-",
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError as exc:
+                raise ClipRenderingError(
+                    f"Failed to execute Intel QSV runtime preflight: {exc}"
+                ) from exc
+            if result.returncode != 0:
+                diagnostic = result.stderr.strip() or result.stdout.strip()
+                if cls._is_qsv_initialization_failure(diagnostic):
+                    return False
+                detail = f": {diagnostic}" if diagnostic else ""
+                raise ClipRenderingError(
+                    "Intel QSV runtime preflight failed for a reason unrelated "
+                    f"to device or encoder initialization{detail}"
+                )
+            cls._qsv_preflight_successes.add(cache_key)
+            return True
+
+    @staticmethod
+    def _is_qsv_initialization_failure(diagnostic: str) -> bool:
+        normalized = " ".join(diagnostic.casefold().split())
+        return any(
+            marker in normalized
+            for marker in (
+                "mfx",
+                "quick sync",
+                "qsv device",
+                "qsv session",
+                "h264_qsv encoder",
+                "unknown encoder 'h264_qsv'",
+                'unknown encoder "h264_qsv"',
+                "no device available",
+                "device creation failed",
+                "device setup failed",
+                "failed to initialise vaapi connection",
+                "failed to initialize vaapi connection",
+                "intel media driver",
+            )
+        )
+
+    @staticmethod
+    def _is_subtitle_failure(diagnostic: str) -> bool:
+        normalized = diagnostic.casefold()
+        return any(
+            marker in normalized
+            for marker in ("subtitle", "libass", "ass filter", "fontconfig")
+        )
 
     def _normalized_output_format(self) -> str:
         return self._config.output_format.removeprefix(".")

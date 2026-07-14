@@ -1,9 +1,10 @@
 """FFmpeg-backed clip rendering services."""
 
-from clip_rendering.config import ClipRendererConfig
+from clip_rendering.config import ClipRendererConfig, RendererBackend
 from clip_rendering.errors import (
     ClipRenderingError,
     InvalidRenderInputError,
+    IntelQSVUnavailableError,
     RenderingFFmpegNotFoundError,
     SubtitleRenderingError,
 )
@@ -19,8 +20,10 @@ __all__ = [
     "ClipRendererConfig",
     "ClipRenderingError",
     "InvalidRenderInputError",
+    "IntelQSVUnavailableError",
     "RenderCommandRunner",
     "RenderingFFmpegNotFoundError",
+    "RendererBackend",
     "SubtitleRenderingError",
     "SubprocessRenderCommandRunner",
     "escape_subtitle_filter_path",

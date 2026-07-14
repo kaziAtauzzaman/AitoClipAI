@@ -1,10 +1,18 @@
 """Configuration for deterministic FFmpeg clip rendering."""
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 
 DEFAULT_CLIP_OUTPUT_DIR = Path("data") / "clips"
+
+
+class RendererBackend(str, Enum):
+    """Explicit video-encoding backend; software remains the production default."""
+
+    SOFTWARE = "software"
+    INTEL_QSV = "intel_qsv"
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +26,7 @@ class ClipRendererConfig:
     overwrite_existing: bool = False
     output_format: str = "mp4"
     video_codec: str = "libx264"
+    renderer_backend: RendererBackend = RendererBackend.SOFTWARE
     audio_codec: str = "aac"
     maximum_clips: int | None = 1
     ffmpeg_binary: str = "ffmpeg"

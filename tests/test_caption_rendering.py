@@ -11,6 +11,8 @@ from captioning import CaptionArtifact, CaptionGenerator, CaptionGeneratorConfig
 from clip_rendering import (
     ClipRenderer,
     ClipRendererConfig,
+    IntelQSVUnavailableError,
+    RendererBackend,
     SubtitleRenderingError,
     escape_subtitle_filter_path,
 )
@@ -21,6 +23,7 @@ from core import (
     Observation,
     ObserverResult,
 )
+from pipeline.validation import ArtifactValidator
 
 
 class FakeRunner:
@@ -284,6 +287,81 @@ def test_burned_subtitle_offline_ffmpeg_integration(tmp_path: Path) -> None:
     assert video_duration == pytest.approx(1.0, abs=0.08)
     assert audio_duration == pytest.approx(1.0, abs=0.08)
     assert abs(video_duration - audio_duration) <= 0.05
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="FFmpeg and ffprobe are required",
+)
+def test_intel_qsv_burned_subtitle_hardware_integration(tmp_path: Path) -> None:
+    source = tmp_path / "qsv source fixture.mp4"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg") or "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:size=320x180:rate=30:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    clip_score = score(source, 0.4, 1.4)
+    captions = artifact(clip_score, tmp_path / "captions" / "qsv.srt")
+    config = ClipRendererConfig(
+        output_dir=tmp_path / "qsv clips",
+        overwrite_existing=True,
+        burn_subtitles=True,
+        renderer_backend=RendererBackend.INTEL_QSV,
+    )
+    renderer = ClipRenderer(config)
+    try:
+        captioned = renderer.render([clip_score], [captions])[0]
+    except IntelQSVUnavailableError as exc:
+        pytest.skip(f"Intel QSV hardware is unavailable: {exc}")
+
+    plain = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "qsv plain clips",
+            overwrite_existing=True,
+            renderer_backend=RendererBackend.INTEL_QSV,
+        )
+    ).render([clip_score])[0]
+    assert captioned.output_path.name.endswith(".intel_qsv.mp4")
+    assert captioned.captions_path == captions.path
+    assert _frame_md5(plain.output_path, 0.4) != _frame_md5(
+        captioned.output_path, 0.4
+    )
+    streams = _probe_streams(captioned.output_path)
+    by_type = {stream["codec_type"]: stream for stream in streams}
+    assert float(by_type["video"]["start_time"]) == pytest.approx(0.0, abs=0.02)
+    assert float(by_type["audio"]["start_time"]) == pytest.approx(0.0, abs=0.02)
+    assert float(by_type["video"]["duration"]) == pytest.approx(1.0, abs=0.08)
+    assert float(by_type["audio"]["duration"]) == pytest.approx(1.0, abs=0.08)
+    validation = ArtifactValidator().validate_jobs([captioned])
+    assert len(validation) == 1
+    assert all(validation[0].checks.values())
+    temporary = captioned.output_path.with_name(
+        f".{captioned.output_path.name}.rendering"
+    )
+    assert not temporary.exists()
 
 
 def _frame_md5(path: Path, timestamp: float) -> str:
