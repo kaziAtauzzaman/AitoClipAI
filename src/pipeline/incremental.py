@@ -26,6 +26,7 @@ from core import (
     RenderJob,
     TimelineGroup,
 )
+from whisper_observer.contracts import finalized_speech_segment_identity
 
 
 class IncrementalCandidateGenerator(Protocol):
@@ -378,6 +379,7 @@ class IncrementalPrerecordedCoordinator:
             raise ValueError("Stable watermark cannot move backwards.")
         if identity is not None:
             _validate_strict_audio_delta_metadata(delta_results)
+            _validate_strict_whisper_delta_metadata(delta_results)
             payload = self._delta_payload_fingerprint(delta_results, watermarks, identity)
             completed = self._completed_delta_receipts.get(self._identity_key(identity))
             if completed is not None:
@@ -560,6 +562,7 @@ class IncrementalPrerecordedCoordinator:
         for identity in identities:
             matching = [item for item in delta_results if item.observer == identity.observer]
             _validate_strict_audio_delta_metadata(matching)
+            _validate_strict_whisper_delta_metadata(matching)
             payload = self._delta_payload_fingerprint(
                 matching, eof.final_watermarks, identity
             )
@@ -877,6 +880,15 @@ class IncrementalPrerecordedCoordinator:
                 if requires_audio_frontier
                 else None
             )
+            whisper_frontier = (
+                _validated_whisper_processed_frontier(result)
+                if strict
+                and any(
+                    item.observer == "whisper" and item.type == "speech"
+                    for item in result.observations
+                )
+                else None
+            )
             for observation in result.observations:
                 end = _observation_end(observation)
                 stability_position = _observation_stability_position(observation)
@@ -885,7 +897,16 @@ class IncrementalPrerecordedCoordinator:
                     and observation.observer == "audio"
                     and observation.type == "peak"
                 )
-                if not finalized_audio_peak and stability_position > observer_watermark:
+                finalized_whisper_speech = (
+                    strict
+                    and observation.observer == "whisper"
+                    and observation.type == "speech"
+                )
+                if (
+                    not finalized_audio_peak
+                    and not finalized_whisper_speech
+                    and stability_position > observer_watermark
+                ):
                     raise ValueError("Observation delta extends beyond its stable watermark.")
                 if (
                     processed_frontier is not None
@@ -895,6 +916,15 @@ class IncrementalPrerecordedCoordinator:
                 ):
                     raise ValueError(
                         "Audio diagnostic observation extends beyond processed frames."
+                    )
+                if (
+                    whisper_frontier is not None
+                    and observation.observer == "whisper"
+                    and observation.type == "speech"
+                    and end > whisper_frontier
+                ):
+                    raise ValueError(
+                        "Finalized Whisper speech extends beyond processed frames."
                     )
                 if end < retention_start:
                     raise ValueError(
@@ -1434,6 +1464,68 @@ def _validate_finalized_audio_peaks(
         raise ValueError(
             "Audio peak observations must exactly match finalized peak metadata."
         )
+
+
+def _validated_whisper_processed_frontier(result: ObserverResult) -> float:
+    frames = result.metadata.get("incremental_frames_processed")
+    sample_rate = result.metadata.get("sample_rate_hz")
+    if (
+        not isinstance(frames, int)
+        or isinstance(frames, bool)
+        or frames <= 0
+    ):
+        raise ValueError(
+            "Strict Whisper speech deltas require a positive integer "
+            "incremental_frames_processed value."
+        )
+    if (
+        not isinstance(sample_rate, (int, float))
+        or isinstance(sample_rate, bool)
+        or not math.isfinite(float(sample_rate))
+        or float(sample_rate) <= 0
+    ):
+        raise ValueError(
+            "Strict Whisper speech deltas require a finite positive numeric "
+            "sample_rate_hz value."
+        )
+    return frames / float(sample_rate)
+
+
+def _validate_strict_whisper_delta_metadata(
+    results: list[ObserverResult],
+) -> None:
+    for result in results:
+        speech = [
+            item
+            for item in result.observations
+            if item.observer == "whisper" and item.type == "speech"
+        ]
+        if not speech:
+            continue
+        _validated_whisper_processed_frontier(result)
+        declared = result.metadata.get("finalized_speech_segment_identities")
+        if not isinstance(declared, (list, tuple)):
+            raise ValueError(
+                "Strict Whisper speech deltas require finalized segment provenance."
+            )
+        if any(
+            not isinstance(item, str)
+            or len(item) != 64
+            or any(character not in "0123456789abcdef" for character in item)
+            for item in declared
+        ):
+            raise ValueError(
+                "Finalized Whisper segment identities must be lowercase SHA-256 values."
+            )
+        if len(declared) != len(set(declared)):
+            raise ValueError("Finalized Whisper segment identities must be unique.")
+        observed = [finalized_speech_segment_identity(item) for item in speech]
+        if len(observed) != len(set(observed)):
+            raise ValueError("Finalized Whisper speech observations must be unique.")
+        if sorted(declared) != sorted(observed):
+            raise ValueError(
+                "Whisper speech observations must exactly match finalized provenance."
+            )
 
 
 def _prefix_at(timeline: FeatureTimeline, requested: float) -> FeatureTimeline:

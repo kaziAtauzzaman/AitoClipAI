@@ -23,6 +23,7 @@ from pipeline import (
     ObserverWatermarks,
     ObserverDeltaIdentity,
 )
+from whisper_observer import finalized_speech_segment_identity
 
 
 class MarkerGenerator:
@@ -311,7 +312,7 @@ def test_future_audio_diagnostic_observation_is_rejected(
         )
 
 
-def test_whisper_segment_must_end_within_stable_watermark(tmp_path):
+def test_unknown_whisper_observation_must_end_within_stable_watermark(tmp_path):
     coordinator = IncrementalPrerecordedCoordinator(
         MarkerGenerator(), TrackingScorer(), CandidateSelector(), Renderer(tmp_path),
         IncrementalPipelineConfig(required_observers=("whisper",)),
@@ -319,7 +320,7 @@ def test_whisper_segment_must_end_within_stable_watermark(tmp_path):
     segment = Observation(
         8.5,
         "whisper",
-        "speech",
+        "unknown",
         {"start": 8.5, "end": 9.0, "score": 0.8, "name": "speech"},
         duration_seconds=1.0,
     )
@@ -566,6 +567,176 @@ def test_eof_finalized_peaks_use_same_uniqueness_contract(tmp_path):
             IncrementalEOF(85.0, ObserverWatermarks({"audio": 85.0})),
             (audio_identity(0, eof=True),),
         )
+
+
+def whisper_coordinator(tmp_path):
+    return IncrementalPrerecordedCoordinator(
+        MarkerGenerator(), TrackingScorer(), CandidateSelector(), Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("whisper",)),
+    )
+
+
+def whisper_speech(start, end, text="finalized speech"):
+    return Observation(
+        start,
+        "whisper",
+        "speech",
+        {
+            "text": text,
+            "speaker": None,
+            "start": start,
+            "end": end,
+            "score": 0.8,
+            "name": text,
+        },
+        duration_seconds=end - start,
+        confidence=0.9,
+    )
+
+
+def whisper_metadata(frames, speech=()):
+    return {
+        "incremental_frames_processed": frames,
+        "sample_rate_hz": 10,
+        "finalized_speech_segment_identities": tuple(
+            finalized_speech_segment_identity(item) for item in speech
+        ),
+    }
+
+
+def whisper_identity(sequence, eof=False):
+    return ObserverDeltaIdentity(
+        "state-cache-fixture",
+        "incremental:state-cache-fixture",
+        "whisper",
+        sequence,
+        eof,
+    )
+
+
+def test_finalized_whisper_speech_may_extend_beyond_held_watermark(tmp_path):
+    coordinator = whisper_coordinator(tmp_path)
+    segment = whisper_speech(153.0, 155.0)
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, [segment], observer="whisper",
+            metadata=whisper_metadata(1600, [segment]),
+        ),
+        ObserverWatermarks({"whisper": 150.0}),
+        whisper_identity(0),
+    )
+    assert coordinator.state_metrics.active_observations == 1
+
+
+def test_undeclared_whisper_speech_beyond_watermark_is_rejected(tmp_path):
+    coordinator = whisper_coordinator(tmp_path)
+    segment = whisper_speech(153.0, 155.0)
+    with pytest.raises(ValueError, match="provenance"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path, [segment], observer="whisper",
+                metadata={"incremental_frames_processed": 1600, "sample_rate_hz": 10},
+            ),
+            ObserverWatermarks({"whisper": 150.0}),
+            whisper_identity(0),
+        )
+
+
+def test_finalized_whisper_speech_beyond_processed_frames_is_rejected(tmp_path):
+    coordinator = whisper_coordinator(tmp_path)
+    segment = whisper_speech(159.0, 161.0)
+    with pytest.raises(ValueError, match="processed frames"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path, [segment], observer="whisper",
+                metadata=whisper_metadata(1600, [segment]),
+            ),
+            ObserverWatermarks({"whisper": 150.0}),
+            whisper_identity(0),
+        )
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        [],
+        ["0" * 64],
+        ["0" * 64, "1" * 64],
+        ["not-a-sha256"],
+        [True],
+        ["0" * 64, "0" * 64],
+    ],
+)
+def test_invalid_finalized_whisper_provenance_is_rejected(tmp_path, declared):
+    coordinator = whisper_coordinator(tmp_path)
+    segment = whisper_speech(153.0, 155.0)
+    metadata = {
+        "incremental_frames_processed": 1600,
+        "sample_rate_hz": 10,
+        "finalized_speech_segment_identities": declared,
+    }
+    with pytest.raises(ValueError, match="Finalized|finalized|provenance"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [segment], observer="whisper", metadata=metadata),
+            ObserverWatermarks({"whisper": 150.0}),
+            whisper_identity(0),
+        )
+
+
+def test_distinct_same_time_finalized_whisper_segments_are_deterministic(tmp_path):
+    coordinator = whisper_coordinator(tmp_path)
+    segments = [
+        whisper_speech(153.0, 155.0, "first wording"),
+        whisper_speech(153.0, 155.0, "second wording"),
+    ]
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, segments, observer="whisper",
+            metadata=whisper_metadata(1600, list(reversed(segments))),
+        ),
+        ObserverWatermarks({"whisper": 150.0}),
+        whisper_identity(0),
+    )
+    assert coordinator.state_metrics.active_observations == 2
+
+
+def test_finalized_whisper_receipt_retry_and_provenance_hashing(tmp_path):
+    coordinator = whisper_coordinator(tmp_path)
+    segments = [
+        whisper_speech(153.0, 155.0, "first wording"),
+        whisper_speech(156.0, 157.0, "second wording"),
+    ]
+    identity = whisper_identity(0)
+    first = delta_timeline(
+        tmp_path, segments, observer="whisper",
+        metadata=whisper_metadata(1600, segments),
+    )
+    coordinator.advance_delta(first, ObserverWatermarks({"whisper": 150.0}), identity)
+    assert coordinator.advance_delta(
+        first, ObserverWatermarks({"whisper": 150.0}), identity
+    ) == []
+    changed = delta_timeline(
+        tmp_path, segments, observer="whisper",
+        metadata=whisper_metadata(1600, list(reversed(segments))),
+    )
+    with pytest.raises(ValueError, match="different content"):
+        coordinator.advance_delta(
+            changed, ObserverWatermarks({"whisper": 150.0}), identity
+        )
+
+
+def test_eof_finalized_whisper_speech_uses_same_contract(tmp_path):
+    coordinator = whisper_coordinator(tmp_path)
+    segment = whisper_speech(153.0, 155.0)
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path, [segment], observer="whisper",
+            metadata=whisper_metadata(1600, [segment]),
+        ),
+        IncrementalEOF(160.0, ObserverWatermarks({"whisper": 160.0})),
+        (whisper_identity(0, eof=True),),
+    )
+    assert len(result.selected_scores) == 1
 
 
 def test_pending_score_and_fingerprint_cache_hits_return_same_score(tmp_path):
@@ -946,16 +1117,34 @@ def test_rolling_boundary_and_eof_match_complete_batch_decisions(tmp_path):
     for item in observations:
         watermarks = {"audio": item.timestamp_seconds + 4.0, "whisper": item.timestamp_seconds + 4.0}
         incremental.advance_delta(
-            delta_timeline(
-                tmp_path,
-                [item],
-                "whisper",
-                {"duration_seconds": duration},
-            ),
+                delta_timeline(
+                    tmp_path,
+                    [item],
+                    "whisper",
+                    {
+                        "duration_seconds": duration,
+                        "incremental_frames_processed": round(
+                            (item.timestamp_seconds + 4.0) * 10
+                        ),
+                        "sample_rate_hz": 10,
+                        "finalized_speech_segment_identities": (
+                            finalized_speech_segment_identity(item),
+                        ),
+                    },
+                ),
             ObserverWatermarks(watermarks),
         )
     result = incremental.flush_delta(
-        delta_timeline(tmp_path, [], "whisper", {"duration_seconds": duration}),
+        delta_timeline(
+            tmp_path,
+            [],
+            "whisper",
+            {
+                "duration_seconds": duration,
+                "incremental_frames_processed": round(duration * 10),
+                "sample_rate_hz": 10,
+            },
+        ),
         IncrementalEOF(duration, ObserverWatermarks({"audio": duration, "whisper": duration})),
     )
 

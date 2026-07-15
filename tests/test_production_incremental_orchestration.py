@@ -30,7 +30,7 @@ from pipeline import (
 from pipeline.incremental import IncrementalPipelineResult
 import pipeline.production_incremental as production_incremental
 from pipeline.contracts import MediaStreamProbe
-from whisper_observer import IncrementalWhisperBatch
+from whisper_observer import IncrementalWhisperBatch, finalized_speech_segment_identity
 
 
 class MarkerGenerator:
@@ -216,13 +216,19 @@ def audio_batch(watermark, observations=(), *, eof=False, frames=None, sample_ra
 
 
 def whisper_batch(watermark, observations=(), *, eof=False, frames=None, sample_rate=10):
+    metadata = {} if sample_rate is None else {"sample_rate_hz": sample_rate}
+    speech = tuple(item for item in observations if item.type == "speech")
+    if speech:
+        metadata["finalized_speech_segment_identities"] = tuple(
+            finalized_speech_segment_identity(item) for item in speech
+        )
     return IncrementalWhisperBatch(
         "whisper",
         tuple(observations),
         watermark,
         round(watermark * 10) if frames is None else frames,
         eof,
-        {} if sample_rate is None else {"sample_rate_hz": sample_rate},
+        metadata,
     )
 
 

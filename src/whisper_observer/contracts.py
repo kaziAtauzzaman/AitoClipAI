@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Protocol
@@ -132,7 +134,12 @@ class IncrementalTranscriptionBackend(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class IncrementalWhisperBatch:
-    """New stable speech observations and the confirmed Whisper watermark."""
+    """New stable speech observations and the confirmed Whisper watermark.
+
+    Every emitted speech observation has left provisional reconciliation state.
+    Its semantic identity is declared in batch metadata even when another
+    provisional segment holds the global watermark behind it.
+    """
 
     observer: str
     observations: tuple[Observation, ...]
@@ -148,3 +155,41 @@ class IncrementalWhisperBatch:
             raise ValueError("Whisper watermark must be finite and non-negative.")
         if self.frames_processed < 0:
             raise ValueError("Processed Whisper frame count cannot be negative.")
+
+
+def finalized_speech_segment_identity(observation: Observation) -> str:
+    """Return a portable semantic identity for one finalized speech observation."""
+
+    if observation.observer != "whisper" or observation.type != "speech":
+        raise ValueError("Finalized speech identities require Whisper speech.")
+    payload = {
+        "observer": observation.observer,
+        "type": observation.type,
+        "timestamp_seconds": observation.timestamp_seconds,
+        "duration_seconds": observation.duration_seconds,
+        "value": observation.value,
+        "confidence": observation.confidence,
+        "metadata": observation.metadata,
+    }
+    encoded = json.dumps(
+        _speech_identity_value(payload), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _speech_identity_value(value: object) -> object:
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("Finalized speech metadata requires string keys.")
+        return {key: _speech_identity_value(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_speech_identity_value(item) for item in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Finalized speech identity values must be finite.")
+        return {"$float": "0" if value == 0 else format(value, ".17g")}
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    raise TypeError(
+        f"Unsupported finalized speech identity value: {type(value).__name__}."
+    )

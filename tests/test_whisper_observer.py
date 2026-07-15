@@ -21,6 +21,7 @@ from whisper_observer import (
     IncrementalWhisperEOF,
     IncrementalWhisperObserverConfig,
     IncrementalWhisperSessionCore,
+    finalized_speech_segment_identity,
     IncrementalWavWhisperObserver,
     LivePcmWhisperObserver,
     OpenAIWhisperBackend,
@@ -874,6 +875,9 @@ def test_incremental_whisper_holds_right_edge_until_next_chunk(
 
     assert first is not None and first.observations == ()
     assert first.metadata["provisional_segment_count"] == 1
+    assert first.metadata["finalized_speech_segment_identities"] == tuple(
+        finalized_speech_segment_identity(item) for item in first.observations
+    )
     assert first.watermark_seconds <= 3.2
     assert second is not None
     assert [item.value["text"] for item in second.observations] == ["edge"]

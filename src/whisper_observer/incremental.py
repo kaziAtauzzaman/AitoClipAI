@@ -20,6 +20,7 @@ from whisper_observer.contracts import (
     SegmentReconciliationPolicy,
     TranscriptionResult,
     TranscriptionSegment,
+    finalized_speech_segment_identity,
 )
 from whisper_observer.errors import InvalidTranscriptionError, TranscriptionError
 
@@ -307,17 +308,21 @@ class IncrementalWhisperSessionCore:
         eof: bool,
     ) -> IncrementalWhisperBatch:
         assert self._sample_rate is not None
+        observations = tuple(self._observation(item) for item in segments)
         metadata = {
             **self._metadata,
             "chunk_index": self._chunk_index,
             "provisional_segment_count": len(self._pending),
             "sample_rate_hz": self._sample_rate,
+            "finalized_speech_segment_identities": tuple(
+                finalized_speech_segment_identity(item) for item in observations
+            ),
         }
         if eof:
             metadata["duration_seconds"] = self._watermark
         return IncrementalWhisperBatch(
             observer=self._config.analysis.observer_name,
-            observations=tuple(self._observation(item) for item in segments),
+            observations=observations,
             watermark_seconds=self._watermark,
             frames_processed=self._frames_processed,
             eof=eof,
