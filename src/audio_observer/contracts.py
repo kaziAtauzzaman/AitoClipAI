@@ -41,6 +41,9 @@ class IncrementalAudioBatch:
     Observations are emitted once their own values can no longer change. The
     watermark may be earlier than an emitted observation's end when an open
     overlapping analysis window, silence segment, or peak competition remains.
+    Diagnostic Audio intervals are stable when their start is at or before the
+    watermark and their end does not exceed ``frames_processed``; their duration
+    describes analyzed context rather than a future revision interval.
     """
 
     observer: str

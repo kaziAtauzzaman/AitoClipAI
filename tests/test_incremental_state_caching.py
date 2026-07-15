@@ -122,6 +122,246 @@ def delta_identity(observer, sequence, eof=False):
     )
 
 
+def audio_coordinator(tmp_path, scorer=None):
+    return IncrementalPrerecordedCoordinator(
+        MarkerGenerator(),
+        scorer or TrackingScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("audio",)),
+    )
+
+
+def audio_diagnostic(kind, timestamp, duration, name="audio-window"):
+    return Observation(
+        timestamp,
+        "audio",
+        kind,
+        {
+            "start": timestamp,
+            "end": timestamp + min(duration, 0.5),
+            "score": 0.8,
+            "name": name,
+        },
+        duration_seconds=duration,
+    )
+
+
+def audio_identity(sequence, eof=False):
+    return ObserverDeltaIdentity(
+        "state-cache-fixture",
+        "incremental:state-cache-fixture",
+        "audio",
+        sequence,
+        eof,
+    )
+
+
+def audio_metadata(frames):
+    return {"incremental_frames_processed": frames, "sample_rate_hz": 10}
+
+
+def test_audio_diagnostic_interval_may_extend_beyond_stable_watermark(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    intensity = audio_diagnostic("speaking_intensity", 8.5, 1.0)
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, [intensity], observer="audio", metadata=audio_metadata(100)
+        ),
+        ObserverWatermarks({"audio": 9.0}),
+        audio_identity(0),
+    )
+
+    assert coordinator.state_metrics.active_observations == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        ({"sample_rate_hz": 10}, "incremental_frames_processed"),
+        ({"incremental_frames_processed": 100}, "sample_rate_hz"),
+        (
+            {"incremental_frames_processed": True, "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": False},
+            "sample_rate_hz",
+        ),
+        (
+            {"incremental_frames_processed": "100", "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": 100.0, "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": float("nan"), "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": float("inf"), "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": "10"},
+            "sample_rate_hz",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": 10 + 0j},
+            "sample_rate_hz",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": float("nan")},
+            "sample_rate_hz",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": float("inf")},
+            "sample_rate_hz",
+        ),
+        (
+            {"incremental_frames_processed": 0, "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": -1, "sample_rate_hz": 10},
+            "incremental_frames_processed",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": 0},
+            "sample_rate_hz",
+        ),
+        (
+            {"incremental_frames_processed": 100, "sample_rate_hz": -10},
+            "sample_rate_hz",
+        ),
+    ],
+)
+def test_strict_audio_diagnostic_requires_valid_frame_metadata(
+    tmp_path, metadata, message
+):
+    coordinator = audio_coordinator(tmp_path)
+    intensity = audio_diagnostic("speaking_intensity", 8.5, 1.0)
+
+    with pytest.raises(ValueError, match=message):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path, [intensity], observer="audio", metadata=metadata
+            ),
+            ObserverWatermarks({"audio": 9.0}),
+            audio_identity(0),
+        )
+
+
+def test_audio_closed_silence_starting_at_watermark_is_stable(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    silence = audio_diagnostic("silence", 9.0, 1.0, "closed-silence")
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, [silence], observer="audio", metadata=audio_metadata(100)
+        ),
+        ObserverWatermarks({"audio": 9.0}),
+        audio_identity(0),
+    )
+
+    assert coordinator.state_metrics.active_observations == 1
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "duration", "message"),
+    [
+        (9.1, 0.5, "stable watermark"),
+        (8.5, 2.0, "processed frames"),
+    ],
+)
+def test_future_audio_diagnostic_observation_is_rejected(
+    tmp_path, timestamp, duration, message
+):
+    coordinator = audio_coordinator(tmp_path)
+    future = audio_diagnostic("speaking_intensity", timestamp, duration)
+
+    with pytest.raises(ValueError, match=message):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path, [future], observer="audio", metadata=audio_metadata(100)
+            ),
+            ObserverWatermarks({"audio": 9.0}),
+            audio_identity(0),
+        )
+
+
+def test_whisper_segment_must_end_within_stable_watermark(tmp_path):
+    coordinator = IncrementalPrerecordedCoordinator(
+        MarkerGenerator(), TrackingScorer(), CandidateSelector(), Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("whisper",)),
+    )
+    segment = Observation(
+        8.5,
+        "whisper",
+        "speech",
+        {"start": 8.5, "end": 9.0, "score": 0.8, "name": "speech"},
+        duration_seconds=1.0,
+    )
+
+    with pytest.raises(ValueError, match="stable watermark"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [segment], observer="whisper"),
+            ObserverWatermarks({"whisper": 9.0}),
+            ObserverDeltaIdentity(
+                "state-cache-fixture",
+                "incremental:state-cache-fixture",
+                "whisper",
+                0,
+            ),
+        )
+
+
+def test_audio_boundary_delta_retry_is_idempotent(tmp_path):
+    scorer = TrackingScorer()
+    coordinator = audio_coordinator(tmp_path, scorer)
+    intensity = audio_diagnostic("speaking_intensity", 8.5, 1.0)
+    timeline = delta_timeline(
+        tmp_path, [intensity], observer="audio", metadata=audio_metadata(100)
+    )
+    identity = audio_identity(0)
+
+    coordinator.advance_delta(
+        timeline, ObserverWatermarks({"audio": 9.0}), identity
+    )
+    assert coordinator.advance_delta(
+        timeline, ObserverWatermarks({"audio": 9.0}), identity
+    ) == []
+
+    assert scorer.candidates == 1
+    assert coordinator.state_metrics.active_observations == 1
+
+
+def test_audio_diagnostic_end_is_retained_then_evicted_as_context(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    intensity = audio_diagnostic("speaking_intensity", 8.5, 1.0)
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, [intensity], observer="audio", metadata=audio_metadata(100)
+        ),
+        ObserverWatermarks({"audio": 9.0}),
+        audio_identity(0),
+    )
+    assert coordinator.state_metrics.active_observations == 1
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, [], observer="audio", metadata=audio_metadata(300)
+        ),
+        ObserverWatermarks({"audio": 30.0}),
+        audio_identity(1),
+    )
+
+    assert coordinator.state_metrics.active_observations == 0
+
+
 def test_pending_score_and_fingerprint_cache_hits_return_same_score(tmp_path):
     scorer = TrackingScorer()
     coordinator = marker_coordinator(tmp_path, scorer)

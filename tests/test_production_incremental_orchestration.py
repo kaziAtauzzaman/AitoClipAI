@@ -426,6 +426,56 @@ def test_real_incremental_audio_and_deterministic_whisper_drive_orchestrator(tmp
     assert len([item for item in report.observer_timings if item.observer == "audio"]) > 1
 
 
+def test_real_audio_diagnostic_window_may_extend_past_batch_watermark(tmp_path):
+    video = tmp_path / "source.mp4"
+    wav = tmp_path / "audio.wav"
+    video.write_bytes(b"video")
+    with wave.open(str(wav), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(10)
+        output.writeframes(b"".join(struct.pack("<h", 16000) for _ in range(30)))
+    audio = IncrementalWavAudioObserver(
+        IncrementalAudioObserverConfig(
+            chunk_frames=5,
+            analysis=AudioObserverConfig(
+                window_seconds=1.0,
+                hop_seconds=0.5,
+                speaking_intensity_threshold_dbfs=-40,
+                peak_threshold=1.0,
+            ),
+        )
+    )
+    whisper = Session([
+        whisper_batch(1.0), whisper_batch(2.0), whisper_batch(3.0, eof=True)
+    ])
+
+    report = ProductionIncrementalOrchestrator(
+        Renderer(tmp_path),
+        session_id="real-audio-boundary-session",
+        audio_observer=audio,
+        whisper_observer=Factory(whisper),
+        artifact_validator=Validator(),
+        candidate_generator=MarkerGenerator(),
+        candidate_scorer=MarkerScorer(),
+        clock=Clock(),
+    ).run(video, wav)
+
+    assert report.status == "completed"
+    assert any(
+        item.observer == "audio"
+        and item.type == "speaking_intensity"
+        and item.timestamp_seconds + (item.duration_seconds or 0.0)
+        > next(
+            timing.watermark_seconds
+            for timing in report.observer_timings
+            if timing.observer == "audio"
+            and timing.watermark_seconds >= item.timestamp_seconds
+        )
+        for item in report.observations
+    )
+
+
 def test_observer_failure_stops_progress_and_cleanup_is_deterministic(tmp_path):
     audio = Session([audio_batch(1.0)], failure_at=1)
     whisper = Session([whisper_batch(0.5), whisper_batch(1.0, eof=True)])

@@ -62,7 +62,14 @@ class IncrementalClipRenderer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ObserverWatermarks:
-    """Observer-confirmed timestamps before which observations are immutable."""
+    """Observer-confirmed timestamps before which observations are immutable.
+
+    Whisper stabilizes complete speech intervals, so a speech observation must
+    end at or before its watermark. Incremental Audio stabilizes emitted event
+    values: diagnostic ``speaking_intensity`` and closed ``silence`` windows may
+    start at or before the watermark even when their descriptive duration
+    extends beyond it.
+    """
 
     stable_through: Mapping[str, float]
 
@@ -370,6 +377,7 @@ class IncrementalPrerecordedCoordinator:
         if stable < self._watermark:
             raise ValueError("Stable watermark cannot move backwards.")
         if identity is not None:
+            _validate_strict_audio_delta_metadata(delta_results)
             payload = self._delta_payload_fingerprint(delta_results, watermarks, identity)
             completed = self._completed_delta_receipts.get(self._identity_key(identity))
             if completed is not None:
@@ -551,6 +559,7 @@ class IncrementalPrerecordedCoordinator:
             )
         for identity in identities:
             matching = [item for item in delta_results if item.observer == identity.observer]
+            _validate_strict_audio_delta_metadata(matching)
             payload = self._delta_payload_fingerprint(
                 matching, eof.final_watermarks, identity
             )
@@ -858,10 +867,30 @@ class IncrementalPrerecordedCoordinator:
                 result.observer,
                 min(float(item) for item in watermarks.stable_through.values()),
             )
+            requires_audio_frontier = strict and any(
+                item.observer == "audio"
+                and item.type in {"speaking_intensity", "silence"}
+                for item in result.observations
+            )
+            processed_frontier = (
+                _validated_audio_processed_frontier(result)
+                if requires_audio_frontier
+                else None
+            )
             for observation in result.observations:
                 end = _observation_end(observation)
-                if end > observer_watermark:
+                stability_position = _observation_stability_position(observation)
+                if stability_position > observer_watermark:
                     raise ValueError("Observation delta extends beyond its stable watermark.")
+                if (
+                    processed_frontier is not None
+                    and observation.observer == "audio"
+                    and observation.type in {"speaking_intensity", "silence"}
+                    and end > processed_frontier
+                ):
+                    raise ValueError(
+                        "Audio diagnostic observation extends beyond processed frames."
+                    )
                 if end < retention_start:
                     raise ValueError(
                         "Observation delta is older than the active revision horizon."
@@ -1310,6 +1339,60 @@ def _canonical_value(value: object) -> object:
 
 def _observation_end(observation: Observation) -> float:
     return observation.timestamp_seconds + (observation.duration_seconds or 0.0)
+
+
+def _observation_stability_position(observation: Observation) -> float:
+    """Return the observer-contract frontier required to accept an observation.
+
+    Audio analysis windows and closed silence spans are immutable once emitted,
+    but their duration is diagnostic context rather than an unresolved future
+    interval. Their start therefore governs delta acceptance. Their full end is
+    still used by rolling retention and candidate-boundary context.
+    """
+
+    if observation.observer == "audio" and observation.type in {
+        "speaking_intensity",
+        "silence",
+    }:
+        return observation.timestamp_seconds
+    return _observation_end(observation)
+
+
+def _validated_audio_processed_frontier(result: ObserverResult) -> float:
+    """Validate the authoritative processed frontier for strict Audio deltas."""
+
+    frames = result.metadata.get("incremental_frames_processed")
+    sample_rate = result.metadata.get("sample_rate_hz")
+    if (
+        not isinstance(frames, int)
+        or isinstance(frames, bool)
+        or frames <= 0
+    ):
+        raise ValueError(
+            "Strict Audio diagnostic deltas require a positive integer "
+            "incremental_frames_processed value."
+        )
+    if (
+        not isinstance(sample_rate, (int, float))
+        or isinstance(sample_rate, bool)
+        or not math.isfinite(float(sample_rate))
+        or float(sample_rate) <= 0
+    ):
+        raise ValueError(
+            "Strict Audio diagnostic deltas require a finite positive numeric "
+            "sample_rate_hz value."
+        )
+    return frames / float(sample_rate)
+
+
+def _validate_strict_audio_delta_metadata(results: list[ObserverResult]) -> None:
+    for result in results:
+        if any(
+            item.observer == "audio"
+            and item.type in {"speaking_intensity", "silence"}
+            for item in result.observations
+        ):
+            _validated_audio_processed_frontier(result)
 
 
 def _prefix_at(timeline: FeatureTimeline, requested: float) -> FeatureTimeline:
