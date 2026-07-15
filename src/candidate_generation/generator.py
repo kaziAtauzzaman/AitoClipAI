@@ -40,6 +40,12 @@ class CandidateGenerator:
 
         return True
 
+    @property
+    def maximum_competition_seconds(self) -> float:
+        """Finite prefix span in which generated candidates may compete."""
+
+        return self._config.maximum_clip_seconds
+
     def generate(self, feature_timeline: FeatureTimeline) -> list[ClipCandidate]:
         """Generate candidate windows without modifying timeline observations."""
 

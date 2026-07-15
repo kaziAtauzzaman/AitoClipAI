@@ -40,10 +40,15 @@ from pipeline.incremental import (
     IncrementalEOF,
     IncrementalPipelineConfig,
     IncrementalPrerecordedCoordinator,
+    IncrementalStateMetrics,
+    ObserverDeltaIdentity,
     ObserverWatermarks,
 )
 from pipeline.validation import ArtifactValidator
 from whisper_observer import IncrementalWavWhisperObserver, IncrementalWhisperBatch
+
+
+_PROCESS_SESSION_SOURCES: dict[str, str] = {}
 
 
 class IncrementalAudioSession(Protocol):
@@ -113,6 +118,7 @@ class ProductionIncrementalReport:
     source_video: Path
     audio_source: Path
     source_id: str | None = None
+    session_id: str | None = None
     observations: list[Observation] = field(default_factory=list)
     selected_scores: list[ClipScore] = field(default_factory=list)
     editorial_strength_results: list[EditorialStrengthResult] = field(
@@ -129,10 +135,12 @@ class ProductionIncrementalReport:
     observer_failures: list[IncrementalFailure] = field(default_factory=list)
     observer_timings: list[TimedObserverBatch] = field(default_factory=list)
     coordinator_timings: list[TimedOperation] = field(default_factory=list)
+    coordinator_decision_timings: list[TimedOperation] = field(default_factory=list)
     render_timings: list[TimedOperation] = field(default_factory=list)
     validation_timings: list[TimedOperation] = field(default_factory=list)
     watermarks: dict[str, float] = field(default_factory=dict)
     total_wall_seconds: float = 0.0
+    coordinator_state_metrics: IncrementalStateMetrics | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return strict canonical JSON-compatible report data."""
@@ -196,12 +204,18 @@ class _InstrumentedRenderer:
 
 
 class ProductionIncrementalOrchestrator:
-    """Single-use orchestration for two real incremental WAV observers."""
+    """Single-use, process-local orchestration for incremental WAV observers.
+
+    Callers persist their run session ID, but acceptance receipts intentionally
+    live only for this process. A terminated process restarts analysis from the
+    beginning under the same run identity.
+    """
 
     def __init__(
         self,
         renderer: IncrementalRenderer,
         *,
+        session_id: str,
         audio_observer: AudioSessionFactory | None = None,
         whisper_observer: WhisperSessionFactory | None = None,
         artifact_validator: IncrementalArtifactValidator | None = None,
@@ -222,8 +236,14 @@ class ProductionIncrementalOrchestrator:
             editorial_strength_evaluator or EditorialStrengthEvaluator()
         )
         self._clock = clock
+        if not session_id.strip():
+            raise ValueError("Production incremental session identity must be non-empty.")
+        self._configured_session_id = session_id
         self._lifecycle = ProductionIncrementalLifecycle.NEW
         self._validation_attempts: set[int] = set()
+        self._pending_validation: dict[int, RenderJob] = {}
+        self._pending_observer_advance: tuple[object, object, object] | None = None
+        self._render_job_cursor = 0
 
     @property
     def lifecycle(self) -> ProductionIncrementalLifecycle:
@@ -248,13 +268,24 @@ class ProductionIncrementalOrchestrator:
         try:
             source_id = _source_id(source_video)
             report.source_id = source_id
+            session_id = self._configured_session_id
+            registered_source = _PROCESS_SESSION_SOURCES.get(session_id)
+            if registered_source is not None and registered_source != source_id:
+                raise RuntimeError(
+                    "Production session identity is already bound to a different source."
+                )
+            _PROCESS_SESSION_SOURCES[session_id] = source_id
+            report.session_id = session_id
             renderer = _InstrumentedRenderer(self._renderer, self._clock, report)
             coordinator = IncrementalPrerecordedCoordinator(
                 self._generator,
                 self._scorer,
                 self._selector,
                 renderer,
-                IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+                IncrementalPipelineConfig(
+                    required_observers=("audio", "whisper"),
+                    session_id=session_id,
+                ),
             )
             with ExitStack() as stack:
                 audio_session = stack.enter_context(_closing(self._audio.session(audio_source)))
@@ -263,47 +294,113 @@ class ProductionIncrementalOrchestrator:
                 )
                 sessions = {"audio": audio_session, "whisper": whisper_session}
                 completed: set[str] = set()
+                forced_fair_turn: str | None = None
                 while len(completed) < 2:
-                    for observer in ("audio", "whisper"):
-                        if observer in completed:
-                            continue
-                        batch = self._read_batch(
-                            observer, sessions[observer], sequences[observer], report
+                    if self._pending_observer_advance is not None:
+                        pending_timeline, pending_watermarks, pending_identity = (
+                            self._pending_observer_advance
                         )
-                        sequences[observer] += 1
-                        if batch is None:
-                            raise RuntimeError(
-                                f"{observer} session ended without authoritative EOF."
-                            )
-                        if batch.observer != observer:
-                            raise RuntimeError(
-                                f"Expected {observer} batch, received {batch.observer}."
-                            )
-                        observations[observer].extend(batch.observations)
-                        metadata[observer].update(batch.metadata)
-                        previous = watermarks[observer]
-                        if batch.watermark_seconds < previous:
-                            raise RuntimeError(f"{observer} watermark moved backwards.")
-                        watermarks[observer] = batch.watermark_seconds
-                        report.watermarks = dict(watermarks)
-                        if batch.eof:
-                            completed.add(observer)
-                            eof_durations[observer] = _authoritative_eof_duration(
-                                observer, batch
-                            )
-                        timeline = _timeline(
-                            source_video, audio_source, source_id, observations, metadata
+                        self._advance(
+                            coordinator,
+                            pending_timeline,
+                            pending_watermarks,
+                            report,
+                            pending_identity,
+                            retrying=True,
                         )
-                        self._advance(coordinator, timeline, watermarks, report)
+                        self._pending_observer_advance = None
+                        continue
+                    available = [
+                        observer
+                        for observer in ("audio", "whisper")
+                        if observer not in completed
+                    ]
+                    if forced_fair_turn in available:
+                        observer = forced_fair_turn
+                        forced_fair_turn = None
+                    else:
+                        observer = min(
+                            available,
+                            key=lambda name: (
+                                watermarks[name],
+                                0 if name == "audio" else 1,
+                            ),
+                        )
+                    batch = self._read_batch(
+                        observer, sessions[observer], sequences[observer], report
+                    )
+                    sequences[observer] += 1
+                    if batch is None:
+                        raise RuntimeError(
+                            f"{observer} session ended without authoritative EOF."
+                        )
+                    if batch.observer != observer:
+                        raise RuntimeError(
+                            f"Expected {observer} batch, received {batch.observer}."
+                        )
+                    observations[observer].extend(batch.observations)
+                    metadata[observer].update(batch.metadata)
+                    previous = watermarks[observer]
+                    if batch.watermark_seconds < previous:
+                        raise RuntimeError(f"{observer} watermark moved backwards.")
+                    if batch.watermark_seconds == previous and not batch.eof:
+                        others = [name for name in available if name != observer]
+                        if others:
+                            forced_fair_turn = min(
+                                others,
+                                key=lambda name: (
+                                    watermarks[name],
+                                    0 if name == "audio" else 1,
+                                ),
+                            )
+                    watermarks[observer] = batch.watermark_seconds
+                    report.watermarks = dict(watermarks)
+                    if batch.eof:
+                        completed.add(observer)
+                        eof_durations[observer] = _authoritative_eof_duration(
+                            observer, batch
+                        )
+                    timeline = _delta_timeline(
+                        source_video,
+                        audio_source,
+                        source_id,
+                        observer,
+                        batch.observations,
+                        {
+                            **batch.metadata,
+                            "incremental_frames_processed": batch.frames_processed,
+                        },
+                    )
+                    self._advance(
+                        coordinator,
+                        timeline,
+                        watermarks,
+                        report,
+                        ObserverDeltaIdentity(
+                            source_id,
+                            session_id,
+                            observer,
+                            sequences[observer] - 1,
+                            batch.eof,
+                        ),
+                    )
                 duration = eof_durations["audio"]
                 if not math.isclose(
                     duration, eof_durations["whisper"], rel_tol=0.0, abs_tol=1e-9
                 ):
                     raise RuntimeError("Audio and Whisper EOF durations do not match.")
-                timeline = _timeline(
-                    source_video, audio_source, source_id, observations, metadata
-                )
-                self._flush(coordinator, timeline, watermarks, duration, report)
+                timeline = _empty_timeline(source_video, audio_source, source_id)
+                if not self._flush(
+                    coordinator, timeline, watermarks, duration, report
+                ):
+                    self._flush(
+                        coordinator,
+                        timeline,
+                        watermarks,
+                        duration,
+                        report,
+                        retrying=True,
+                    )
             self._lifecycle = ProductionIncrementalLifecycle.FINISHED
         except BaseException as exc:
             if not report.render_failures or report.render_failures[-1].message != str(exc):
@@ -318,6 +415,9 @@ class ProductionIncrementalOrchestrator:
                 key=lambda item: (item.timestamp_seconds, item.observer, item.type),
             )
             if result is not None:
+                report.coordinator_state_metrics = getattr(
+                    coordinator, "state_metrics", None
+                )
                 report.selected_scores = result.selected_scores
                 report.suppressed = result.suppressed
                 report.render_jobs = result.render_jobs
@@ -413,64 +513,153 @@ class ProductionIncrementalOrchestrator:
                 )
             )
 
-    def _advance(self, coordinator, timeline, watermarks, report) -> None:
+    def _advance(
+        self,
+        coordinator,
+        timeline,
+        watermarks,
+        report,
+        identity=None,
+        *,
+        retrying=False,
+    ) -> None:
         started = self._clock()
         sequence = len(report.coordinator_timings)
+        render_timing_start = len(report.render_timings)
         render_failure_count = len(report.render_failures)
         succeeded = False
         try:
-            coordinator.advance(timeline, ObserverWatermarks(dict(watermarks)))
+            advance = getattr(coordinator, "advance_delta", None)
+            if advance is None:
+                coordinator.advance(timeline, ObserverWatermarks(dict(watermarks)))
+            elif identity is None:
+                advance(timeline, ObserverWatermarks(dict(watermarks)))
+            else:
+                advance(
+                    timeline,
+                    ObserverWatermarks(dict(watermarks)),
+                    identity,
+                )
             succeeded = True
         except BaseException:
             if len(report.render_failures) > render_failure_count:
-                self._validate(self._unvalidated_jobs(coordinator, report), report)
+                self._validate_pending(coordinator, report)
+                if retrying:
+                    raise
+                self._pending_observer_advance = (
+                    timeline,
+                    dict(watermarks),
+                    identity,
+                )
                 return
             raise
         finally:
+            elapsed = max(0.0, self._clock() - started)
+            nested_render = sum(
+                item.elapsed_seconds
+                for item in report.render_timings[render_timing_start:]
+            )
             report.coordinator_timings.append(
                 TimedOperation(
                     "coordinator_advance",
                     f"advance:{sequence}",
-                    max(0.0, self._clock() - started),
+                    elapsed,
                     succeeded,
                 )
             )
-        self._validate(self._unvalidated_jobs(coordinator, report), report)
+            report.coordinator_decision_timings.append(
+                TimedOperation(
+                    "coordinator_decision",
+                    f"advance:{sequence}",
+                    max(0.0, elapsed - nested_render),
+                    succeeded,
+                )
+            )
+        self._validate_pending(coordinator, report)
 
-    def _flush(self, coordinator, timeline, watermarks, duration, report) -> None:
+    def _flush(
+        self,
+        coordinator,
+        timeline,
+        watermarks,
+        duration,
+        report,
+        *,
+        retrying=False,
+    ) -> bool:
         started = self._clock()
         sequence = len(report.coordinator_timings)
+        render_timing_start = len(report.render_timings)
+        render_failure_count = len(report.render_failures)
         succeeded = False
         try:
-            coordinator.flush(
-                timeline,
-                IncrementalEOF(duration, ObserverWatermarks(dict(watermarks))),
-            )
+            flush = getattr(coordinator, "flush_delta", None)
+            if flush is None:
+                coordinator.flush(
+                    timeline,
+                    IncrementalEOF(duration, ObserverWatermarks(dict(watermarks))),
+                )
+            else:
+                flush(
+                    timeline,
+                    IncrementalEOF(duration, ObserverWatermarks(dict(watermarks))),
+                )
             succeeded = True
+        except BaseException:
+            if len(report.render_failures) > render_failure_count and not retrying:
+                return False
+            raise
         finally:
+            elapsed = max(0.0, self._clock() - started)
+            nested_render = sum(
+                item.elapsed_seconds
+                for item in report.render_timings[render_timing_start:]
+            )
             report.coordinator_timings.append(
                 TimedOperation(
                     "coordinator_flush",
                     f"flush:{sequence}",
-                    max(0.0, self._clock() - started),
+                    elapsed,
                     succeeded,
                 )
             )
-            self._validate(self._unvalidated_jobs(coordinator, report), report)
+            report.coordinator_decision_timings.append(
+                TimedOperation(
+                    "coordinator_decision",
+                    f"flush:{sequence}",
+                    max(0.0, elapsed - nested_render),
+                    succeeded,
+                )
+            )
+            self._validate_pending(coordinator, report)
+        return True
 
-    def _unvalidated_jobs(self, coordinator, report) -> list[RenderJob]:
-        return [
-            job
-            for job in coordinator.result.render_jobs
-            if _render_identity(job) not in self._validation_attempts
-        ]
+    def _validate_pending(self, coordinator, report) -> None:
+        while True:
+            if self._pending_validation:
+                identity, job = next(iter(self._pending_validation.items()))
+            else:
+                job_at = getattr(coordinator, "render_job_at", None)
+                if job_at is None:
+                    jobs = coordinator.render_jobs_since(self._render_job_cursor)
+                    job = jobs[0] if jobs else None
+                else:
+                    job = job_at(self._render_job_cursor)
+                if job is None:
+                    return
+                identity = _render_identity(job)
+                self._pending_validation[identity] = job
+            self._validate([job], report)
+            if identity not in self._validation_attempts:
+                return
+            self._pending_validation.pop(identity, None)
+            self._render_job_cursor += 1
 
     def _validate(self, jobs: list[RenderJob], report: ProductionIncrementalReport) -> None:
         for job in jobs:
             identity = _render_identity(job)
             if identity in self._validation_attempts:
                 continue
-            self._validation_attempts.add(identity)
             started = self._clock()
             succeeded = False
             try:
@@ -478,7 +667,7 @@ class ProductionIncrementalOrchestrator:
                 validation = _validated_artifact(job, results)
                 report.artifact_validations.append(validation)
                 succeeded = True
-            except BaseException as exc:
+            except Exception as exc:
                 report.artifact_validation_failures.append(
                     IncrementalFailure(
                         "artifact_validation",
@@ -497,6 +686,7 @@ class ProductionIncrementalOrchestrator:
                         succeeded,
                     )
                 )
+            self._validation_attempts.add(identity)
 
 
 class _closing:
@@ -549,25 +739,38 @@ def _validated_artifact(job: RenderJob, results: object) -> RenderedArtifactVali
     return result
 
 
-def _timeline(media, audio, source_id, observations, metadata) -> FeatureTimeline:
-    results = [
-        ObserverResult(name, list(observations[name]), dict(metadata[name]))
-        for name in ("audio", "whisper")
-    ]
-    combined = sorted(
-        observations["audio"] + observations["whisper"],
-        key=lambda item: (item.timestamp_seconds, item.observer, item.type),
-    )
-    groups: dict[float, list[Observation]] = {}
-    for item in combined:
-        groups.setdefault(item.timestamp_seconds, []).append(item)
+def _delta_timeline(
+    media: Path,
+    audio: Path,
+    source_id: str,
+    observer: str,
+    observations: Sequence[Observation],
+    metadata: Mapping[str, object],
+) -> FeatureTimeline:
+    """Build only the newly stable observer batch; coordinator owns active history."""
+
+    items = list(observations)
+    grouped: dict[float, list[Observation]] = {}
+    for item in items:
+        grouped.setdefault(item.timestamp_seconds, []).append(item)
     return FeatureTimeline(
         media_path=media,
         audio_path=audio,
         timeline_path=audio.with_suffix(".incremental.json"),
         timeline=AggregatedTimeline(
-            [TimelineGroup(key, groups[key]) for key in sorted(groups)], results
+            [TimelineGroup(key, grouped[key]) for key in sorted(grouped)],
+            [ObserverResult(observer, items, dict(metadata))],
         ),
+        metadata={"source_id": source_id, "input_type": "local"},
+    )
+
+
+def _empty_timeline(media: Path, audio: Path, source_id: str) -> FeatureTimeline:
+    return FeatureTimeline(
+        media_path=media,
+        audio_path=audio,
+        timeline_path=audio.with_suffix(".incremental.json"),
+        timeline=AggregatedTimeline([], []),
         metadata={"source_id": source_id, "input_type": "local"},
     )
 

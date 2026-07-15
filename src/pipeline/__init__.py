@@ -25,8 +25,10 @@ from pipeline.incremental import (
     IncrementalEOF,
     IncrementalPipelineConfig,
     IncrementalPipelineResult,
+    IncrementalStateMetrics,
     IncrementalPrerecordedCoordinator,
     ObserverWatermarks,
+    ObserverDeltaIdentity,
     RenderLifecycleState,
 )
 from pipeline.persistence import JsonFeatureTimelineWriter, TimelineWriter
@@ -63,8 +65,10 @@ __all__ = [
     "IncrementalPipelineConfig",
     "IncrementalEOF",
     "IncrementalPipelineResult",
+    "IncrementalStateMetrics",
     "IncrementalPrerecordedCoordinator",
     "ObserverWatermarks",
+    "ObserverDeltaIdentity",
     "RenderLifecycleState",
     "MediaProbe",
     "MediaProbeError",

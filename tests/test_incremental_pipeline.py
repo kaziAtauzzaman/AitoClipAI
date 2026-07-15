@@ -47,6 +47,7 @@ from whisper_observer import (
 
 class MarkerGenerator:
     maximum_backtrack_seconds = 5.0
+    maximum_competition_seconds = 5.0
     incremental_deterministic = True
 
     def generate(self, timeline: FeatureTimeline) -> list[ClipCandidate]:
@@ -420,6 +421,10 @@ class UnsafeGenerator(MarkerGenerator):
     maximum_backtrack_seconds = float("inf")
 
 
+class UnboundedCompetitionGenerator(MarkerGenerator):
+    maximum_competition_seconds = float("inf")
+
+
 class GlobalStateScorer(MarkerScorer):
     candidate_local_deterministic = False
 
@@ -427,6 +432,15 @@ class GlobalStateScorer(MarkerScorer):
 def test_unsafe_generator_backtracking_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="finite and non-negative"):
         coordinator(tmp_path, RecordingRenderer(tmp_path), generator=UnsafeGenerator())
+
+
+def test_unbounded_selector_competition_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="maximum_competition_seconds"):
+        coordinator(
+            tmp_path,
+            RecordingRenderer(tmp_path),
+            generator=UnboundedCompetitionGenerator(),
+        )
 
 
 def test_global_state_scorer_is_rejected(tmp_path: Path) -> None:

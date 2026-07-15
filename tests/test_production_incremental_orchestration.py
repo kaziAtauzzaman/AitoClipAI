@@ -12,6 +12,8 @@ from audio_observer import (
     IncrementalWavAudioObserver,
 )
 from candidate_selection import CandidateSelector
+from candidate_generation import CandidateGenerator
+from candidate_scoring import CandidateScorer
 from core import (
     ClipCandidate,
     ClipScore,
@@ -33,6 +35,7 @@ from whisper_observer import IncrementalWhisperBatch
 
 class MarkerGenerator:
     maximum_backtrack_seconds = 0.0
+    maximum_competition_seconds = 5.0
     incremental_deterministic = True
 
     def generate(self, timeline):
@@ -42,7 +45,11 @@ class MarkerGenerator:
                 float(item.value["start"]),
                 float(item.value["end"]),
                 str(item.value["name"]),
-                metadata={"score": float(item.value["score"]), "observation": item},
+                metadata={
+                    "score": float(item.value["score"]),
+                    "observation": item,
+                    "contributing_observations": [item],
+                },
             )
             for result in timeline.timeline.observer_results
             for item in result.observations
@@ -62,6 +69,7 @@ class MarkerScorer:
 
 class EditorialEvidenceGenerator:
     maximum_backtrack_seconds = 0.0
+    maximum_competition_seconds = 5.0
     incremental_deterministic = True
 
     def generate(self, timeline):
@@ -225,6 +233,7 @@ def orchestrator(
 ):
     return ProductionIncrementalOrchestrator(
         renderer or Renderer(tmp_path),
+        session_id="production-test-session",
         audio_observer=Factory(audio),
         whisper_observer=Factory(whisper),
         artifact_validator=validator or Validator(),
@@ -255,6 +264,83 @@ def test_slower_whisper_blocks_then_multiple_watermarks_render_chronologically(t
     assert [identity for _, identity in renderer.calls] == [1, 2]
     assert report.watermarks == {"audio": 7.0, "whisper": 7.0}
     assert report.status == "completed"
+
+
+def test_stagnant_watermark_forces_deterministic_other_observer_turn(tmp_path):
+    audio = Session([
+        audio_batch(0.0, frames=1),
+        audio_batch(0.0, frames=2),
+        audio_batch(2.0, eof=True, frames=20),
+    ])
+    whisper = Session([
+        whisper_batch(1.0, frames=10),
+        whisper_batch(2.0, eof=True, frames=20),
+    ])
+    report = orchestrator(tmp_path, audio, whisper).run(*sources(tmp_path))
+
+    assert report.status == "completed"
+    assert [item.observer for item in report.observer_timings] == [
+        "audio", "whisper", "audio", "whisper", "audio"
+    ]
+
+
+def test_production_orchestration_uses_observation_deltas_and_separate_decision_timing(
+    tmp_path,
+    monkeypatch,
+):
+    original_delta_timeline = production_incremental._delta_timeline
+    batch_sizes = []
+
+    def track_delta_timeline(*args, **kwargs):
+        observations = args[4]
+        batch_sizes.append(len(observations))
+        return original_delta_timeline(*args, **kwargs)
+
+    monkeypatch.setattr(
+        production_incremental,
+        "_delta_timeline",
+        track_delta_timeline,
+    )
+    first = marker("audio", 1.0, 1.0, 2.0, "first", 0.8)
+    second = marker("audio", 3.0, 3.0, 4.0, "second", 0.9)
+    report = orchestrator(
+        tmp_path,
+        Session([audio_batch(2.0, [first]), audio_batch(5.0, [second], eof=True)]),
+        Session([whisper_batch(2.0), whisper_batch(5.0, eof=True)]),
+    ).run(*sources(tmp_path))
+
+    assert report.status == "completed"
+    assert batch_sizes == [1, 0, 1, 0]
+    assert len(report.coordinator_decision_timings) == len(report.coordinator_timings)
+    assert all(
+        decision.elapsed_seconds <= total.elapsed_seconds
+        for decision, total in zip(
+            report.coordinator_decision_timings,
+            report.coordinator_timings,
+        )
+    )
+
+
+def test_scheduler_keeps_unequal_observer_chunks_near_the_safe_watermark(tmp_path):
+    audio = Session(
+        [
+            audio_batch(float(value), eof=value == 50)
+            for value in range(5, 51, 5)
+        ]
+    )
+    whisper = Session(
+        [whisper_batch(25.0), whisper_batch(50.0, eof=True)]
+    )
+
+    report = orchestrator(tmp_path, audio, whisper).run(*sources(tmp_path))
+
+    observed = {"audio": 0.0, "whisper": 0.0}
+    maximum_lead = 0.0
+    for timing in report.observer_timings:
+        observed[timing.observer] = timing.watermark_seconds
+        maximum_lead = max(maximum_lead, abs(observed["audio"] - observed["whisper"]))
+    assert report.status == "completed"
+    assert maximum_lead <= 25.0
 
 
 def test_combined_eof_flushes_overlap_winner_once(tmp_path):
@@ -326,6 +412,7 @@ def test_real_incremental_audio_and_deterministic_whisper_drive_orchestrator(tmp
     ])
     report = ProductionIncrementalOrchestrator(
         Renderer(tmp_path),
+        session_id="real-audio-test-session",
         audio_observer=audio,
         whisper_observer=Factory(whisper),
         artifact_validator=Validator(),
@@ -375,6 +462,35 @@ def test_render_and_artifact_failures_are_reported_separately(tmp_path):
     assert len(report2.render_jobs) == 1
 
 
+def test_render_failure_resumes_same_accepted_delta_before_new_input(tmp_path):
+    class FailsOnceRenderer(Renderer):
+        def __init__(self, output_dir):
+            super().__init__(output_dir)
+            self.failed = False
+
+        def render_one(self, score, identity):
+            if not self.failed:
+                self.failed = True
+                self.calls.append((score, identity))
+                raise RuntimeError("render failed once")
+            return super().render_one(score, identity)
+
+    candidate = marker("audio", 1.0, 1.0, 2.0, "clip", 0.8)
+    renderer = FailsOnceRenderer(tmp_path)
+    report = orchestrator(
+        tmp_path,
+        Session([audio_batch(3.0, [candidate]), audio_batch(4.0, eof=True)]),
+        Session([whisper_batch(3.0), whisper_batch(4.0, eof=True)]),
+        renderer=renderer,
+    ).run(*sources(tmp_path))
+
+    assert report.status == "completed_with_failures"
+    assert len(report.render_failures) == 1
+    assert len(report.render_jobs) == 1
+    assert len(report.selected_scores) == 1
+    assert [identity for _, identity in renderer.calls] == [1, 1]
+
+
 def test_report_order_and_timing_fields_are_deterministic(tmp_path):
     item = marker("audio", 1.0, 1.0, 2.0, "clip", 0.8)
     report = orchestrator(
@@ -411,6 +527,39 @@ def test_post_activation_setup_failure_returns_failed_report(
     assert runner.lifecycle is ProductionIncrementalLifecycle.FAILED
     with pytest.raises(RuntimeError, match="single-use"):
         runner.run(video, wav)
+
+
+def test_process_session_identity_cannot_bind_to_different_source(tmp_path):
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    first_video, first_wav = sources(tmp_path / "first")
+    second_video, second_wav = sources(tmp_path / "second")
+    second_video.write_bytes(b"different-video")
+    session_id = "source-binding-session"
+    first = ProductionIncrementalOrchestrator(
+        Renderer(tmp_path),
+        session_id=session_id,
+        audio_observer=Factory(Session([audio_batch(1.0, eof=True)])),
+        whisper_observer=Factory(Session([whisper_batch(1.0, eof=True)])),
+        artifact_validator=Validator(),
+        candidate_generator=MarkerGenerator(),
+        candidate_scorer=MarkerScorer(),
+        clock=Clock(),
+    ).run(first_video, first_wav)
+    second = ProductionIncrementalOrchestrator(
+        Renderer(tmp_path),
+        session_id=session_id,
+        audio_observer=Factory(Session([audio_batch(1.0, eof=True)])),
+        whisper_observer=Factory(Session([whisper_batch(1.0, eof=True)])),
+        artifact_validator=Validator(),
+        candidate_generator=MarkerGenerator(),
+        candidate_scorer=MarkerScorer(),
+        clock=Clock(),
+    ).run(second_video, second_wav)
+
+    assert first.status == "completed"
+    assert second.status == "failed"
+    assert "different source" in second.observer_failures[0].message
 
 
 def test_coordinator_advance_exception_closes_sessions(tmp_path, monkeypatch):
@@ -477,8 +626,219 @@ def test_flush_validates_success_before_later_render_failure(tmp_path):
     assert report.status == "failed"
     assert len(report.render_jobs) == 1
     assert len(report.artifact_validations) == 1
-    assert len(report.render_failures) == 1
+    assert len(report.render_failures) == 2
     assert report.validation_timings[0].operation_identity == "validation:1"
+
+
+def test_validation_cursor_survives_interruption_after_job_discovery(tmp_path, monkeypatch):
+    runner = orchestrator(tmp_path, Session([]), Session([]))
+    report = production_incremental.ProductionIncrementalReport(
+        "running", tmp_path / "source.mp4", tmp_path / "audio.wav"
+    )
+    candidate = ClipCandidate(tmp_path / "source.mp4", 1.0, 2.0, "candidate")
+    job = RenderJob(
+        candidate,
+        tmp_path / "clip.mp4",
+        metadata={"incremental_render_identity": 1},
+    )
+
+    class Jobs:
+        def render_jobs_since(self, index):
+            return [job] if index == 0 else []
+
+    original = runner._validate
+    interrupted = False
+
+    def interrupt_once(jobs, target_report):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+        original(jobs, target_report)
+
+    monkeypatch.setattr(runner, "_validate", interrupt_once)
+    with pytest.raises(KeyboardInterrupt):
+        runner._validate_pending(Jobs(), report)
+    assert runner._render_job_cursor == 0
+    assert runner._pending_validation == {1: job}
+
+    runner._validate_pending(Jobs(), report)
+    assert runner._render_job_cursor == 1
+    assert not runner._pending_validation
+    assert len(report.artifact_validations) == 1
+
+
+def test_malformed_render_identity_does_not_advance_validation_cursor(tmp_path):
+    runner = orchestrator(tmp_path, Session([]), Session([]))
+    report = production_incremental.ProductionIncrementalReport(
+        "running", tmp_path / "source.mp4", tmp_path / "audio.wav"
+    )
+    candidate = ClipCandidate(tmp_path / "source.mp4", 1.0, 2.0, "candidate")
+    malformed = RenderJob(candidate, tmp_path / "clip.mp4")
+
+    class Jobs:
+        def render_jobs_since(self, index):
+            return [malformed] if index == 0 else []
+
+    with pytest.raises(RuntimeError, match="stable identity"):
+        runner._validate_pending(Jobs(), report)
+    assert runner._render_job_cursor == 0
+    assert not runner._pending_validation
+
+
+def test_validator_cancellation_keeps_same_job_pending_for_resume(tmp_path):
+    class CancelsOnce(Validator):
+        def __init__(self):
+            super().__init__()
+            self.cancelled = False
+
+        def validate_jobs(self, jobs):
+            if not self.cancelled:
+                self.cancelled = True
+                raise KeyboardInterrupt()
+            return super().validate_jobs(jobs)
+
+    validator = CancelsOnce()
+    runner = orchestrator(
+        tmp_path, Session([]), Session([]), validator=validator
+    )
+    report = production_incremental.ProductionIncrementalReport(
+        "running", tmp_path / "source.mp4", tmp_path / "audio.wav"
+    )
+    candidate = ClipCandidate(tmp_path / "source.mp4", 1.0, 2.0, "candidate")
+    job = RenderJob(
+        candidate,
+        tmp_path / "clip.mp4",
+        metadata={"incremental_render_identity": 1},
+    )
+
+    class Jobs:
+        def render_job_at(self, index):
+            return job if index == 0 else None
+
+    with pytest.raises(KeyboardInterrupt):
+        runner._validate_pending(Jobs(), report)
+    assert runner._render_job_cursor == 0
+    assert runner._pending_validation == {1: job}
+    assert not report.artifact_validation_failures
+
+    runner._validate_pending(Jobs(), report)
+    assert runner._render_job_cursor == 1
+    assert len(report.artifact_validations) == 1
+
+
+def test_many_job_validation_discovery_is_linear(tmp_path):
+    runner = orchestrator(tmp_path, Session([]), Session([]))
+    report = production_incremental.ProductionIncrementalReport(
+        "running", tmp_path / "source.mp4", tmp_path / "audio.wav"
+    )
+    candidate = ClipCandidate(tmp_path / "source.mp4", 1.0, 2.0, "candidate")
+    jobs = [
+        RenderJob(
+            candidate,
+            tmp_path / f"clip-{identity}.mp4",
+            metadata={"incremental_render_identity": identity},
+        )
+        for identity in range(1, 501)
+    ]
+
+    class IndexedJobs:
+        def __init__(self):
+            self.lookups = 0
+
+        def render_job_at(self, index):
+            self.lookups += 1
+            return jobs[index] if index < len(jobs) else None
+
+        def render_jobs_since(self, index):
+            raise AssertionError("suffix copying must not be used")
+
+    source = IndexedJobs()
+    runner._validate_pending(source, report)
+    assert source.lookups == len(jobs) + 1
+    assert runner._render_job_cursor == len(jobs)
+    assert len(report.artifact_validations) == len(jobs)
+
+
+@pytest.mark.parametrize("scale", [1, 2, 4])
+def test_real_production_components_scale_with_bounded_delta_state(
+    tmp_path, monkeypatch, scale
+):
+    captured = []
+    real_coordinator = production_incremental.IncrementalPrerecordedCoordinator
+
+    class TrackingCoordinator(real_coordinator):
+        def flush_delta(self, *args, **kwargs):
+            result = super().flush_delta(*args, **kwargs)
+            captured.append(self.state_metrics)
+            return result
+
+    monkeypatch.setattr(
+        production_incremental,
+        "IncrementalPrerecordedCoordinator",
+        TrackingCoordinator,
+    )
+    count = 40 * scale
+    audio_batches = []
+    whisper_batches = []
+    for index in range(count):
+        end = float((index + 1) * 5)
+        dense_burst = True
+        audio_observations = [
+            Observation(
+                end - 3.5,
+                "audio",
+                "silence",
+                {"loudness_dbfs": -55.0},
+                duration_seconds=2.0,
+            ),
+            Observation(end - 1.0, "audio", "peak", {"amplitude": 0.97}),
+            Observation(
+                end - 1.0,
+                "audio",
+                "speaking_intensity",
+                {"intensity": 0.9, "loudness_dbfs": -16.0},
+                duration_seconds=0.5,
+            ),
+        ] if dense_burst else []
+        speech = [Observation(
+            end - 0.8,
+            "whisper",
+            "speech",
+            {"text": f"dense deterministic moment {index}"},
+            duration_seconds=0.5,
+            confidence=0.9,
+        )] if dense_burst else []
+        audio_batches.append(audio_batch(end, audio_observations))
+        whisper_batches.append(whisper_batch(end, speech))
+    duration = float(count * 5 + 5)
+    audio_batches.append(audio_batch(duration, eof=True))
+    whisper_batches.append(whisper_batch(duration, eof=True))
+    video, wav = sources(tmp_path)
+    report = ProductionIncrementalOrchestrator(
+        Renderer(tmp_path),
+        session_id=f"scaling-session-{scale}",
+        audio_observer=Factory(Session(audio_batches)),
+        whisper_observer=Factory(Session(whisper_batches)),
+        artifact_validator=Validator(),
+        candidate_generator=CandidateGenerator(),
+        candidate_scorer=CandidateScorer(),
+        candidate_selector=CandidateSelector(),
+        clock=Clock(),
+    ).run(video, wav)
+
+    assert report.status == "completed"
+    metrics = captured[-1]
+    assert metrics.generation_passes <= count * 2 + 3
+    assert metrics.scored_candidates <= count * 4
+    assert metrics.candidate_fingerprints <= count * 28
+    assert metrics.peak_active_observations <= 105
+    assert metrics.peak_active_scores <= 14
+    assert metrics.peak_unresolved_group_size == 1
+    assert metrics.finalized_scores == count
+    assert metrics.immutable_score_fingerprints == count
+    assert metrics.completed_render_jobs == count
+    assert report.selected_scores
 
 
 @pytest.mark.parametrize("mode", ["empty", "multiple", "mismatch", "malformed"])
@@ -532,6 +892,22 @@ def test_report_serialization_is_canonical_and_strict(tmp_path):
     second = report.to_dict()
     json.dumps(first)
     assert first == second
+    assert first["coordinator_state_metrics"]["active_observations"] == 0
+    assert first["coordinator_state_metrics"]["scored_candidates"] == 1
+    assert set(first["coordinator_state_metrics"]) == {
+        "active_observations",
+        "active_scores",
+        "candidate_fingerprints",
+        "completed_render_jobs",
+        "finalized_scores",
+        "generation_passes",
+        "immutable_score_fingerprints",
+        "peak_active_observations",
+        "peak_active_scores",
+        "peak_unresolved_group_size",
+        "score_fingerprints",
+        "scored_candidates",
+    }
     assert "\\" not in first["source_video"]
     output = JsonProductionIncrementalReportWriter(tmp_path / "report.json").write(report)
     assert json.loads(output.read_text(encoding="utf-8")) == first

@@ -46,6 +46,15 @@ class CandidateSelector:
             )
         return CandidateSelectionResult(selected=selected, suppressed=suppressed)
 
+    def competes(self, first: ClipCandidate, second: ClipCandidate) -> bool:
+        """Return whether two candidates participate in the same suppression decision."""
+
+        overlap_seconds, overlap_ratio = _overlap(first, second)
+        return (
+            overlap_seconds >= self._config.minimum_overlap_seconds
+            and overlap_ratio >= self._config.overlap_ratio_threshold
+        )
+
     def _substantial_overlap(
         self,
         score: ClipScore,
