@@ -38,6 +38,22 @@ class MarkerGenerator:
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
 
+    @staticmethod
+    def revision_start_seconds(candidate):
+        return candidate.start_seconds
+
+    @classmethod
+    def revision_stable_after_seconds(cls, candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def revision_partition_seconds(candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def earliest_unresolved_cluster_start_seconds(timeline, stable):
+        return None
+
     def generate(self, timeline):
         return [
             ClipCandidate(
@@ -71,6 +87,22 @@ class EditorialEvidenceGenerator:
     maximum_backtrack_seconds = 0.0
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
+
+    @staticmethod
+    def revision_start_seconds(candidate):
+        return candidate.start_seconds
+
+    @classmethod
+    def revision_stable_after_seconds(cls, candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def revision_partition_seconds(candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def earliest_unresolved_cluster_start_seconds(timeline, stable):
+        return None
 
     def generate(self, timeline):
         valid = [
@@ -934,9 +966,9 @@ def test_real_production_components_scale_with_bounded_delta_state(
     metrics = captured[-1]
     assert metrics.generation_passes <= count * 2 + 3
     assert metrics.scored_candidates <= count * 4
-    assert metrics.candidate_fingerprints <= count * 28
+    assert metrics.candidate_fingerprints <= count * 30
     assert metrics.peak_active_observations <= 105
-    assert metrics.peak_active_scores <= 14
+    assert metrics.peak_active_scores <= 15
     assert metrics.peak_unresolved_group_size == 1
     assert metrics.finalized_scores == count
     assert metrics.immutable_score_fingerprints == count

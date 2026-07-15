@@ -50,6 +50,22 @@ class MarkerGenerator:
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
 
+    @staticmethod
+    def revision_start_seconds(candidate):
+        return candidate.start_seconds
+
+    @classmethod
+    def revision_stable_after_seconds(cls, candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def revision_partition_seconds(candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def earliest_unresolved_cluster_start_seconds(timeline, stable):
+        return None
+
     def generate(self, timeline: FeatureTimeline) -> list[ClipCandidate]:
         return [
             ClipCandidate(

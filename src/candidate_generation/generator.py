@@ -46,6 +46,42 @@ class CandidateGenerator:
 
         return self._config.maximum_clip_seconds
 
+    def revision_start_seconds(self, candidate: ClipCandidate) -> float:
+        """Return the start of the generator cluster that owns ``candidate``."""
+
+        return float(candidate.metadata["original_cluster_start"])
+
+    def revision_stable_after_seconds(self, candidate: ClipCandidate) -> float:
+        """Return the watermark after which this candidate cannot be revised."""
+
+        return self.revision_start_seconds(candidate) + self._config.maximum_clip_seconds
+
+    def revision_partition_seconds(self, candidate: ClipCandidate) -> float:
+        """Return the closed cluster boundary safe to exclude from regeneration."""
+
+        return float(candidate.metadata["original_cluster_end"])
+
+    def earliest_unresolved_cluster_start_seconds(
+        self,
+        feature_timeline: FeatureTimeline,
+        stable_watermark_seconds: float,
+    ) -> float | None:
+        """Return the earliest cluster that can still accept stable observations.
+
+        This includes clusters that have not accumulated enough confidence to
+        produce a candidate.  The hard padded-span limit closes every cluster
+        no later than one ``maximum_clip_seconds`` span after its first event.
+        """
+
+        unresolved = [
+            min(event.start_seconds for event in cluster)
+            for cluster in self._clusters(self._events(feature_timeline))
+            if stable_watermark_seconds
+            < min(event.start_seconds for event in cluster)
+            + self._config.maximum_clip_seconds
+        ]
+        return min(unresolved) if unresolved else None
+
     def generate(self, feature_timeline: FeatureTimeline) -> list[ClipCandidate]:
         """Generate candidate windows without modifying timeline observations."""
 

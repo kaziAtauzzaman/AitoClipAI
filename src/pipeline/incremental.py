@@ -41,6 +41,18 @@ class IncrementalCandidateGenerator(Protocol):
     @property
     def maximum_competition_seconds(self) -> float: ...
 
+    def revision_start_seconds(self, candidate: ClipCandidate) -> float: ...
+
+    def revision_stable_after_seconds(self, candidate: ClipCandidate) -> float: ...
+
+    def revision_partition_seconds(self, candidate: ClipCandidate) -> float: ...
+
+    def earliest_unresolved_cluster_start_seconds(
+        self,
+        timeline: FeatureTimeline,
+        stable_watermark_seconds: float,
+    ) -> float | None: ...
+
     def generate(self, timeline: FeatureTimeline) -> list[ClipCandidate]: ...
 
 
@@ -179,6 +191,7 @@ class _DeltaAcceptance:
     payload: str
     state: DeltaAcceptanceState = DeltaAcceptanceState.RECEIVED
     scores: list[ClipScore] = field(default_factory=list)
+    unresolved_revision_start: float | None = None
     safe_scores: list[ClipScore] = field(default_factory=list)
     pending_renders: list[tuple[ClipScore, str, int]] = field(default_factory=list)
     completed_jobs: list[RenderJob] = field(default_factory=list)
@@ -250,6 +263,7 @@ class IncrementalPrerecordedCoordinator:
         self._candidate_object_ids: dict[int, str] = {}
         self._finalized_scores: dict[str, ClipScore] = {}
         self._immutable_through = 0.0
+        self._finalized_generation_through = 0.0
         self._generation_passes = 0
         self._scored_candidates = 0
         self._candidate_fingerprint_count = 0
@@ -413,6 +427,9 @@ class IncrementalPrerecordedCoordinator:
         receipt = self._pending_delta if identity is not None else None
         if receipt is None or receipt.state is DeltaAcceptanceState.INGESTED:
             generation_timeline = self._generation_timeline(timeline)
+            unresolved_revision_start = self._earliest_unresolved_revision_start(
+                generation_timeline, stable
+            )
             scores = (
                 self._scores_for_active(
                     generation_timeline,
@@ -423,9 +440,11 @@ class IncrementalPrerecordedCoordinator:
             )
             if receipt is not None:
                 receipt.scores = scores
+                receipt.unresolved_revision_start = unresolved_revision_start
                 receipt.state = DeltaAcceptanceState.GENERATION_SCORED
         else:
             scores = receipt.scores
+            unresolved_revision_start = receipt.unresolved_revision_start
         passing = [
             score
             for score in scores
@@ -435,6 +454,9 @@ class IncrementalPrerecordedCoordinator:
         safe: list[ClipScore] = []
         for group in self._overlap_groups(passing):
             group_end = max(score.candidate.end_seconds for score in group)
+            group_revision_stable_after = max(
+                self._revision_stable_after(score.candidate) for score in group
+            )
             earliest_end = min(score.candidate.end_seconds for score in group)
             self._peak_unresolved_group_size = max(
                 self._peak_unresolved_group_size, len(group)
@@ -443,19 +465,31 @@ class IncrementalPrerecordedCoordinator:
                 raise RuntimeError(
                     "Continuous overlap competition exceeded the declared finite bound."
                 )
-            if group_end + self._competition_horizon <= stable:
+            if max(
+                group_end + self._competition_horizon,
+                group_revision_stable_after,
+            ) <= stable:
                 safe.extend(group)
         safe_ids = {self._score_candidate_id(score) for score in safe}
         for score in scores:
             candidate_id = self._score_candidate_id(score)
+            revision_stable = self._revision_stable_after(score.candidate) <= stable
+            competition_closed = (
+                score.candidate.end_seconds + self._competition_horizon <= stable
+            )
             if candidate_id in safe_ids or (
                 score.passed_threshold is not True
-                and score.candidate.end_seconds + self._competition_horizon <= stable
+                and revision_stable
+                and competition_closed
             ):
                 self._finalized_scores[candidate_id] = score
                 fingerprint = self._score_fingerprint_cache.pop(candidate_id, None)
                 if fingerprint is not None:
                     self._immutable_score_fingerprints[candidate_id] = fingerprint
+                self._finalized_generation_through = max(
+                    self._finalized_generation_through,
+                    self._revision_partition(score.candidate),
+                )
         if receipt is not None and receipt.state is DeltaAcceptanceState.GENERATION_SCORED:
             receipt.safe_scores = safe
             receipt.pending_renders = self._commit_decisions(safe)
@@ -473,16 +507,27 @@ class IncrementalPrerecordedCoordinator:
             if receipt is not None:
                 receipt.state = DeltaAcceptanceState.FAILED_RETRYABLE
             raise
-        immutable_through = max(0.0, stable - self._competition_horizon)
-        unsafe_passing_ends = [
-            score.candidate.end_seconds
-            for score in passing
-            if self._score_candidate_id(score) not in safe_ids
+        unsafe_revision_starts = [
+            self._revision_start(score.candidate)
+            for score in scores
+            if self._score_candidate_id(score) not in self._finalized_scores
         ]
-        if unsafe_passing_ends:
-            immutable_through = min(
-                immutable_through,
-                math.nextafter(min(unsafe_passing_ends), float("-inf")),
+        if unresolved_revision_start is not None:
+            unsafe_revision_starts.append(unresolved_revision_start)
+        if unsafe_revision_starts:
+            earliest_unsafe = min(unsafe_revision_starts)
+            immutable_through = (
+                earliest_unsafe
+                if earliest_unsafe <= stable
+                else max(
+                    0.0,
+                    stable - self._competition_horizon - self._backtrack_horizon,
+                )
+            )
+        else:
+            immutable_through = max(
+                self._finalized_generation_through,
+                stable - self._competition_horizon - self._backtrack_horizon,
             )
         self._immutable_through = max(self._immutable_through, immutable_through)
         self._evict_inactive_state(stable, scores)
@@ -656,6 +701,16 @@ class IncrementalPrerecordedCoordinator:
         competition = getattr(self._generator, "maximum_competition_seconds", None)
         deterministic = getattr(self._generator, "incremental_deterministic", False)
         candidate_local = getattr(self._scorer, "candidate_local_deterministic", False)
+        revision_start = getattr(self._generator, "revision_start_seconds", None)
+        revision_stable_after = getattr(
+            self._generator, "revision_stable_after_seconds", None
+        )
+        revision_partition = getattr(
+            self._generator, "revision_partition_seconds", None
+        )
+        unresolved_cluster_start = getattr(
+            self._generator, "earliest_unresolved_cluster_start_seconds", None
+        )
         if isinstance(backtrack, bool) or not isinstance(backtrack, int | float):
             raise ValueError("Incremental generator must declare maximum_backtrack_seconds.")
         backtrack = float(backtrack)
@@ -676,7 +731,77 @@ class IncrementalPrerecordedCoordinator:
             raise ValueError("Incremental generator must declare deterministic prefix output.")
         if candidate_local is not True:
             raise ValueError("Incremental scorer must be deterministic and candidate-local.")
+        if (
+            not callable(revision_start)
+            or not callable(revision_stable_after)
+            or not callable(revision_partition)
+            or not callable(unresolved_cluster_start)
+        ):
+            raise ValueError(
+                "Incremental generator must declare candidate revision boundaries."
+            )
         return backtrack, competition
+
+    def _revision_start(self, candidate: ClipCandidate) -> float:
+        return self._revision_contract(candidate)[0]
+
+    def _revision_partition(self, candidate: ClipCandidate) -> float:
+        return self._revision_contract(candidate)[1]
+
+    def _revision_stable_after(self, candidate: ClipCandidate) -> float:
+        return self._revision_contract(candidate)[2]
+
+    def _revision_contract(
+        self, candidate: ClipCandidate
+    ) -> tuple[float, float, float]:
+        raw = (
+            self._generator.revision_start_seconds(candidate),
+            self._generator.revision_partition_seconds(candidate),
+            self._generator.revision_stable_after_seconds(candidate),
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int | float)
+            for value in raw
+        ):
+            raise ValueError("Candidate revision contract values must be numeric.")
+        start, partition, stable_after = (float(value) for value in raw)
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (start, partition, stable_after)
+        ):
+            raise ValueError(
+                "Candidate revision contract values must be finite and non-negative."
+            )
+        if not start <= partition <= stable_after:
+            raise ValueError(
+                "Candidate revision contract must satisfy start <= partition <= stable-after."
+            )
+        if start > candidate.end_seconds or stable_after < candidate.end_seconds:
+            raise ValueError("Candidate revision contract does not cover its candidate.")
+        if stable_after - candidate.end_seconds > self._backtrack_horizon:
+            raise ValueError(
+                "Candidate revision stability exceeds maximum_backtrack_seconds."
+            )
+        return start, partition, stable_after
+
+    def _earliest_unresolved_revision_start(
+        self,
+        timeline: FeatureTimeline,
+        stable: float,
+    ) -> float | None:
+        value = self._generator.earliest_unresolved_cluster_start_seconds(
+            timeline, stable
+        )
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("Unresolved cluster start must be numeric or None.")
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "Unresolved cluster start must be finite and non-negative."
+            )
+        return value
 
     def _activate(self, timeline: FeatureTimeline) -> None:
         if self._lifecycle is CoordinatorLifecycle.FLUSHED:
@@ -970,7 +1095,7 @@ class IncrementalPrerecordedCoordinator:
                     [
                         item
                         for item in self._active_observations[name]
-                        if _observation_end(item) > self._immutable_through
+                        if item.timestamp_seconds >= self._immutable_through
                         or self._observation_id(item) in boundary_ids
                     ],
                     dict(self._observer_metadata[name]),

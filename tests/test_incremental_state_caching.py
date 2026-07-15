@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from aggregation import FeatureAggregator
-from candidate_generation import CandidateGenerator
-from candidate_scoring import CandidateScorer
+from candidate_generation import CandidateGenerationConfig, CandidateGenerator
+from candidate_scoring import CandidateScorer, CandidateScoringConfig
 from candidate_selection import CandidateSelector
 from core import (
     AggregatedTimeline,
@@ -30,6 +30,22 @@ class MarkerGenerator:
     maximum_backtrack_seconds = 5.0
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
+
+    @staticmethod
+    def revision_start_seconds(candidate):
+        return candidate.start_seconds
+
+    @classmethod
+    def revision_stable_after_seconds(cls, candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def revision_partition_seconds(candidate):
+        return candidate.end_seconds
+
+    @staticmethod
+    def earliest_unresolved_cluster_start_seconds(timeline, stable):
+        return None
 
     def generate(self, timeline):
         return [
@@ -1159,6 +1175,444 @@ def test_rolling_boundary_and_eof_match_complete_batch_decisions(tmp_path):
     assert [identity(item) for item in result.scores] == [identity(item) for item in batch_scores]
     assert [identity(item) for item in result.selected_scores] == [identity(item) for item in batch.selected]
     assert [item.reason for item in result.suppressed] == [item.reason for item in batch.suppressed]
+
+
+def intensity(timestamp, value=0.8):
+    return Observation(
+        float(timestamp),
+        "audio",
+        "speaking_intensity",
+        {"intensity": value, "loudness_dbfs": -18.0},
+        duration_seconds=1.0,
+    )
+
+
+def test_real_generator_keeps_evolving_cluster_revision_mutable(tmp_path):
+    observations = [intensity(index * 0.5, 0.8) for index in range(360)]
+    duration = 200.0
+    full = FeatureTimeline(
+        media_path=tmp_path / "source.mp4",
+        audio_path=tmp_path / "audio.wav",
+        timeline_path=tmp_path / "timeline.json",
+        timeline=FeatureAggregator().aggregate(
+            [ObserverResult("audio", observations, {"duration_seconds": duration})]
+        ),
+        metadata={"source_id": "state-cache-dense-revisions"},
+    )
+    generator = CandidateGenerator()
+    scorer = CandidateScorer()
+    selector = CandidateSelector()
+    batch_scores = scorer.score(generator.generate(full))
+    batch = selector.select(item for item in batch_scores if item.passed_threshold)
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        selector,
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio",)),
+    )
+
+    for offset in range(0, len(observations), 10):
+        batch_observations = observations[offset : offset + 10]
+        frontier = batch_observations[-1].timestamp_seconds + 1.0
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                batch_observations,
+                "audio",
+                {
+                    "duration_seconds": duration,
+                    "incremental_frames_processed": round(frontier * 10),
+                    "sample_rate_hz": 10,
+                },
+            ),
+            ObserverWatermarks({"audio": batch_observations[-1].timestamp_seconds}),
+        )
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path,
+            [],
+            "audio",
+            {
+                "duration_seconds": duration,
+                "incremental_frames_processed": round(duration * 10),
+                "sample_rate_hz": 10,
+            },
+        ),
+        IncrementalEOF(duration, ObserverWatermarks({"audio": duration})),
+    )
+
+    identity = lambda score: (
+        score.candidate.start_seconds,
+        score.candidate.end_seconds,
+        score.overall_score,
+    )
+    assert [identity(item) for item in result.scores] == [
+        identity(item) for item in batch_scores
+    ], (
+        [
+            (
+                item.candidate.metadata.get("original_cluster_start"),
+                item.candidate.metadata.get("original_cluster_end"),
+            )
+            for item in result.scores
+        ],
+        [
+            (
+                item.candidate.metadata.get("original_cluster_start"),
+                item.candidate.metadata.get("original_cluster_end"),
+            )
+            for item in batch_scores
+        ],
+    )
+    assert [identity(item) for item in result.selected_scores] == [
+        identity(item) for item in batch.selected
+    ]
+    assert len(renderer.calls) == len(batch.selected)
+    assert coordinator.state_metrics.peak_active_observations < 260
+
+
+def test_candidate_revision_contract_covers_boundary_anchor_and_score_changes(tmp_path):
+    generator = CandidateGenerator()
+    early = [intensity(index * 0.5, 0.55) for index in range(90)]
+    later = [
+        Observation(
+            40.0 + index * 0.5,
+            "whisper",
+            "speech",
+            {"text": f"strong reaction {index}", "speaker": None},
+            duration_seconds=2.0,
+            confidence=0.99,
+        )
+        for index in range(3)
+    ]
+    prefix = complete_timeline(tmp_path, early, 100.0)
+    revised = complete_timeline(tmp_path, [*early, *later], 100.0)
+    first = generator.generate(prefix)[0]
+    final = generator.generate(revised)[0]
+
+    assert (first.start_seconds, first.end_seconds) != (
+        final.start_seconds,
+        final.end_seconds,
+    )
+    assert first.metadata["contributing_observations"] != final.metadata[
+        "contributing_observations"
+    ]
+    assert generator.revision_start_seconds(first) == 0.0
+    assert generator.revision_stable_after_seconds(first) == 60.0
+
+
+def test_below_confidence_overlapping_cluster_survives_until_it_becomes_candidate(
+    tmp_path,
+):
+    first_cluster = [intensity(index * 0.5, 0.8) for index in range(109)]
+    early_next_cluster = Observation(
+        54.5,
+        "audio",
+        "speaking_intensity",
+        {"intensity": 0.8, "loudness_dbfs": -18.0},
+        duration_seconds=50.0,
+    )
+    completing_evidence = intensity(106.5, 0.8)
+    observations = [*first_cluster, early_next_cluster, completing_evidence]
+    duration = 180.0
+    generator = CandidateGenerator(
+        CandidateGenerationConfig(minimum_candidate_confidence=0.5)
+    )
+    scorer = CandidateScorer(CandidateScoringConfig(passing_score=0.0))
+    selector = CandidateSelector()
+    full = FeatureTimeline(
+        media_path=tmp_path / "source.mp4",
+        audio_path=tmp_path / "audio.wav",
+        timeline_path=tmp_path / "timeline.json",
+        timeline=FeatureAggregator().aggregate(
+            [ObserverResult("audio", observations, {"duration_seconds": duration})]
+        ),
+        metadata={"source_id": "state-cache-fixture"},
+    )
+    batch_scores = scorer.score(generator.generate(full))
+    batch = selector.select(item for item in batch_scores if item.passed_threshold)
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        selector,
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio",)),
+    )
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [*first_cluster, early_next_cluster],
+            "audio",
+            {
+                "duration_seconds": duration,
+                "incremental_frames_processed": 1060,
+                "sample_rate_hz": 10,
+            },
+        ),
+        ObserverWatermarks({"audio": 106.0}),
+    )
+    assert coordinator._immutable_through == 54.5
+    assert early_next_cluster in coordinator._active_observations["audio"]
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [completing_evidence],
+            "audio",
+            {
+                "duration_seconds": duration,
+                "incremental_frames_processed": 1075,
+                "sample_rate_hz": 10,
+            },
+        ),
+        ObserverWatermarks({"audio": 107.5}),
+    )
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path,
+            [],
+            "audio",
+            {
+                "duration_seconds": duration,
+                "incremental_frames_processed": 1800,
+                "sample_rate_hz": 10,
+            },
+        ),
+        IncrementalEOF(duration, ObserverWatermarks({"audio": duration})),
+    )
+
+    identity = lambda score: (
+        score.candidate.start_seconds,
+        score.candidate.end_seconds,
+        score.overall_score,
+    )
+    assert [identity(item) for item in result.selected_scores] == [
+        identity(item) for item in batch.selected
+    ]
+    assert len(renderer.calls) == len(batch.selected) == 2
+
+
+@pytest.mark.parametrize(
+    ("start", "partition", "stable_after"),
+    [
+        (-1.0, 2.0, 2.0),
+        (0.0, -1.0, 2.0),
+        (0.0, 3.0, 2.0),
+        (2.0, 1.0, 3.0),
+        (0.0, float("nan"), 2.0),
+        (0.0, 2.0, float("inf")),
+        ("bad", 2.0, 2.0),
+    ],
+)
+def test_malformed_or_inconsistent_revision_contract_is_rejected(
+    tmp_path, start, partition, stable_after
+):
+    class InvalidRevisionGenerator(MarkerGenerator):
+        @staticmethod
+        def revision_start_seconds(candidate):
+            return start
+
+        @staticmethod
+        def revision_partition_seconds(candidate):
+            return partition
+
+        @staticmethod
+        def revision_stable_after_seconds(candidate):
+            return stable_after
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        InvalidRevisionGenerator(),
+        TrackingScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    with pytest.raises(ValueError, match="revision contract"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [marker(1, 0, 2, 0.8, "invalid")]),
+            ObserverWatermarks({"fixture": 10.0}),
+        )
+
+
+def test_validation_04_replacement_boundaries_never_render_as_old_revisions(tmp_path):
+    class Validation04RevisionGenerator:
+        maximum_backtrack_seconds = 70.0
+        maximum_competition_seconds = 0.0
+        incremental_deterministic = True
+
+        @staticmethod
+        def generate(timeline):
+            observations = [
+                item
+                for result in timeline.timeline.observer_results
+                for item in result.observations
+            ]
+            final = any(item.value.get("phase") == "final" for item in observations)
+            boundaries = (
+                [(73.0, 108.0), (102.6035, 135.0)]
+                if final
+                else [(85.225, 119.0), (123.0, 156.0)]
+            )
+            return [
+                ClipCandidate(
+                    timeline.media_path,
+                    start,
+                    end,
+                    f"revision-{index}",
+                    metadata={
+                        "score": 0.8,
+                        "revision_start": 50.0 if index == 0 else 100.0,
+                        "revision_partition": 105.0 if index == 0 else 153.0,
+                        "contributing_observations": observations,
+                    },
+                )
+                for index, (start, end) in enumerate(boundaries)
+            ]
+
+        @staticmethod
+        def revision_start_seconds(candidate):
+            return candidate.metadata["revision_start"]
+
+        @staticmethod
+        def revision_partition_seconds(candidate):
+            return candidate.metadata["revision_partition"]
+
+        @staticmethod
+        def revision_stable_after_seconds(candidate):
+            return 170.0
+
+        @staticmethod
+        def earliest_unresolved_cluster_start_seconds(timeline, stable):
+            return 50.0 if stable < 170.0 else None
+
+    initial = Observation(150.0, "fixture", "phase", {"phase": "initial"})
+    final = Observation(165.0, "fixture", "phase", {"phase": "final"})
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        Validation04RevisionGenerator(),
+        TrackingScorer(),
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+
+    assert coordinator.advance_delta(
+        delta_timeline(tmp_path, [initial]),
+        ObserverWatermarks({"fixture": 160.0}),
+    ) == []
+    assert renderer.calls == []
+    jobs = coordinator.advance_delta(
+        delta_timeline(tmp_path, [final]),
+        ObserverWatermarks({"fixture": 170.0}),
+    )
+
+    assert [
+        (job.candidate.start_seconds, job.candidate.end_seconds) for job in jobs
+    ] == [(73.0, 108.0), (102.6035, 135.0)]
+    assert all(
+        (score.candidate.start_seconds, score.candidate.end_seconds)
+        not in {(85.225, 119.0), (123.0, 156.0)}
+        for score in coordinator.result.selected_scores
+    )
+
+
+def test_retained_evidence_can_revise_score_without_moving_candidate_boundary(tmp_path):
+    generator = CandidateGenerator()
+    scorer = CandidateScorer()
+    anchor = speech(10.0, "complete reaction")
+    support = intensity(12.0, 0.95)
+    prefix = complete_timeline(tmp_path, [anchor], 80.0)
+    revised = complete_timeline(tmp_path, [anchor, support], 80.0)
+    first = scorer.score(generator.generate(prefix))[0]
+    final = scorer.score(generator.generate(revised))[0]
+
+    assert (
+        first.candidate.start_seconds,
+        first.candidate.end_seconds,
+    ) == (
+        final.candidate.start_seconds,
+        final.candidate.end_seconds,
+    )
+    assert first.candidate.source_signals != final.candidate.source_signals
+    assert first.candidate.metadata["confidence"] != final.candidate.metadata["confidence"]
+    assert first.overall_score != final.overall_score
+
+
+def test_overlapping_whisper_revisions_render_only_final_identity(tmp_path):
+    observations = [
+        speech(10.0, "first provisional wording"),
+        speech(12.0, "reconciled wording"),
+        speech(14.0, "final complete wording"),
+    ]
+    duration = 90.0
+    full = complete_timeline(tmp_path, observations, duration)
+    generator = CandidateGenerator()
+    scorer = CandidateScorer(CandidateScoringConfig(passing_score=0.0))
+    selector = CandidateSelector()
+    batch_scores = scorer.score(generator.generate(full))
+    batch = selector.select(item for item in batch_scores if item.passed_threshold)
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        selector,
+        renderer,
+        IncrementalPipelineConfig(required_observers=("whisper",)),
+    )
+
+    for sequence, item in enumerate(observations):
+        frontier = item.timestamp_seconds + (item.duration_seconds or 0.0)
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [item],
+                "whisper",
+                {
+                    "duration_seconds": duration,
+                    "incremental_frames_processed": round(frontier * 10),
+                    "sample_rate_hz": 10,
+                    "finalized_speech_segment_identities": (
+                        finalized_speech_segment_identity(item),
+                    ),
+                },
+            ),
+            ObserverWatermarks({"whisper": frontier}),
+            ObserverDeltaIdentity(
+                "state-cache-fixture",
+                "incremental:state-cache-fixture",
+                "whisper",
+                sequence,
+                False,
+            ),
+        )
+        assert renderer.calls == []
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path,
+            [],
+            "whisper",
+            {
+                "duration_seconds": duration,
+                "incremental_frames_processed": round(duration * 10),
+                "sample_rate_hz": 10,
+            },
+        ),
+        IncrementalEOF(duration, ObserverWatermarks({"whisper": duration})),
+    )
+
+    identity = lambda score: (
+        score.candidate.start_seconds,
+        score.candidate.end_seconds,
+        score.overall_score,
+    )
+    assert [identity(item) for item in result.selected_scores] == [
+        identity(item) for item in batch.selected
+    ]
+    assert len(renderer.calls) == 1
 
 
 @pytest.mark.parametrize("count", [1000, 2000, 4000])
