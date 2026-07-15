@@ -44,6 +44,9 @@ class IncrementalAudioBatch:
     Diagnostic Audio intervals are stable when their start is at or before the
     watermark and their end does not exceed ``frames_processed``; their duration
     describes analyzed context rather than a future revision interval.
+    Emitted peaks are final only when their timestamp is declared in batch
+    metadata; peak-distance competition or authoritative EOF has already closed
+    before such a peak is emitted.
     """
 
     observer: str

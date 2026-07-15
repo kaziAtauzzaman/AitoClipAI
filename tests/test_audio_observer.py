@@ -397,6 +397,14 @@ def test_incremental_peak_suppression_crosses_chunk_boundary(tmp_path: Path) -> 
         (0.8, pytest.approx(0.95, abs=0.0001)),
     ]
 
+    batches = incremental_batches(path, config, chunk_frames=4)
+    for batch in batches:
+        emitted = tuple(
+            item.timestamp_seconds for item in batch.observations if item.type == "peak"
+        )
+        if emitted:
+            assert batch.metadata["finalized_peak_timestamps_seconds"] == emitted
+
 
 def test_incremental_analysis_windows_are_not_lost_or_duplicated(tmp_path: Path) -> None:
     path = write_wav(tmp_path / "windows.wav", [0.5] * 12)

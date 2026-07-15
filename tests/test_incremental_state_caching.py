@@ -157,8 +157,26 @@ def audio_identity(sequence, eof=False):
     )
 
 
-def audio_metadata(frames):
-    return {"incremental_frames_processed": frames, "sample_rate_hz": 10}
+def audio_metadata(frames, finalized_peaks=()):
+    metadata = {"incremental_frames_processed": frames, "sample_rate_hz": 10}
+    if finalized_peaks:
+        metadata["finalized_peak_timestamps_seconds"] = tuple(finalized_peaks)
+    return metadata
+
+
+def audio_peak(timestamp):
+    return Observation(
+        timestamp,
+        "audio",
+        "peak",
+        {
+            "amplitude": 1.0,
+            "start": timestamp,
+            "end": timestamp + 0.1,
+            "score": 0.8,
+            "name": "finalized-peak",
+        },
+    )
 
 
 def test_audio_diagnostic_interval_may_extend_beyond_stable_watermark(tmp_path):
@@ -360,6 +378,194 @@ def test_audio_diagnostic_end_is_retained_then_evicted_as_context(tmp_path):
     )
 
     assert coordinator.state_metrics.active_observations == 0
+
+
+def test_finalized_audio_peak_uses_processed_frontier_not_watermark(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    peak = audio_peak(84.6530625)
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [peak],
+            observer="audio",
+            metadata=audio_metadata(850, [peak.timestamp_seconds]),
+        ),
+        ObserverWatermarks({"audio": 84.0}),
+        audio_identity(0),
+    )
+
+    assert coordinator.state_metrics.active_observations == 1
+
+
+def test_audio_peak_beyond_processed_frontier_is_rejected(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    peak = audio_peak(85.1)
+
+    with pytest.raises(ValueError, match="processed frames"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [peak],
+                observer="audio",
+                metadata=audio_metadata(850, [peak.timestamp_seconds]),
+            ),
+            ObserverWatermarks({"audio": 84.0}),
+            audio_identity(0),
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        audio_metadata(850),
+        {"incremental_frames_processed": 850, "sample_rate_hz": 10,
+         "finalized_peak_timestamps_seconds": [True]},
+        {"incremental_frames_processed": 850, "sample_rate_hz": 10,
+         "finalized_peak_timestamps_seconds": [float("nan")]},
+    ],
+)
+def test_unfinalized_or_malformed_audio_peak_is_rejected(tmp_path, metadata):
+    coordinator = audio_coordinator(tmp_path)
+    peak = audio_peak(84.6530625)
+
+    with pytest.raises(ValueError, match="finalized|Finalized"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [peak], observer="audio", metadata=metadata),
+            ObserverWatermarks({"audio": 84.0}),
+            audio_identity(0),
+        )
+
+
+def test_finalized_audio_peak_delta_retry_is_idempotent(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    peak = audio_peak(84.6530625)
+    timeline = delta_timeline(
+        tmp_path,
+        [peak],
+        observer="audio",
+        metadata=audio_metadata(850, [peak.timestamp_seconds]),
+    )
+    identity = audio_identity(0)
+
+    coordinator.advance_delta(
+        timeline, ObserverWatermarks({"audio": 84.0}), identity
+    )
+    assert coordinator.advance_delta(
+        timeline, ObserverWatermarks({"audio": 84.0}), identity
+    ) == []
+    assert coordinator.state_metrics.active_observations == 1
+
+
+def test_duplicate_finalized_peak_provenance_is_rejected(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    peak = audio_peak(84.6530625)
+
+    with pytest.raises(ValueError, match="timestamps must be unique"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [peak],
+                observer="audio",
+                metadata=audio_metadata(
+                    850, [peak.timestamp_seconds, peak.timestamp_seconds]
+                ),
+            ),
+            ObserverWatermarks({"audio": 84.0}),
+            audio_identity(0),
+        )
+
+
+@pytest.mark.parametrize("different_payload", [False, True])
+def test_duplicate_peak_observation_timestamps_are_rejected(
+    tmp_path, different_payload
+):
+    coordinator = audio_coordinator(tmp_path)
+    first = audio_peak(84.6530625)
+    second = audio_peak(84.6530625)
+    if different_payload:
+        second = Observation(
+            second.timestamp_seconds,
+            second.observer,
+            second.type,
+            {**second.value, "amplitude": 0.95},
+        )
+
+    with pytest.raises(ValueError, match="observations must have unique timestamps"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [first, second],
+                observer="audio",
+                metadata=audio_metadata(850, [first.timestamp_seconds]),
+            ),
+            ObserverWatermarks({"audio": 84.0}),
+            audio_identity(0),
+        )
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        [84.6530625],
+        [84.6530625, 84.8, 84.9],
+    ],
+)
+def test_missing_or_extra_finalized_peak_provenance_is_rejected(
+    tmp_path, declared
+):
+    coordinator = audio_coordinator(tmp_path)
+    peaks = [audio_peak(84.6530625), audio_peak(84.8)]
+
+    with pytest.raises(ValueError, match="exactly match"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                peaks,
+                observer="audio",
+                metadata=audio_metadata(850, declared),
+            ),
+            ObserverWatermarks({"audio": 84.0}),
+            audio_identity(0),
+        )
+
+
+def test_unique_finalized_peak_timestamps_match_one_to_one(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    peaks = [audio_peak(84.6530625), audio_peak(84.8)]
+
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            peaks,
+            observer="audio",
+            metadata=audio_metadata(
+                850, [item.timestamp_seconds for item in reversed(peaks)]
+            ),
+        ),
+        ObserverWatermarks({"audio": 84.0}),
+        audio_identity(0),
+    )
+
+    assert coordinator.state_metrics.active_observations == 2
+
+
+def test_eof_finalized_peaks_use_same_uniqueness_contract(tmp_path):
+    coordinator = audio_coordinator(tmp_path)
+    peak = audio_peak(84.8)
+    timeline = delta_timeline(
+        tmp_path,
+        [peak],
+        observer="audio",
+        metadata=audio_metadata(850, [peak.timestamp_seconds, peak.timestamp_seconds]),
+    )
+
+    with pytest.raises(ValueError, match="timestamps must be unique"):
+        coordinator.flush_delta(
+            timeline,
+            IncrementalEOF(85.0, ObserverWatermarks({"audio": 85.0})),
+            (audio_identity(0, eof=True),),
+        )
 
 
 def test_pending_score_and_fingerprint_cache_hits_return_same_score(tmp_path):

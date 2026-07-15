@@ -199,13 +199,19 @@ def marker(observer, at, start, end, name, score):
 
 
 def audio_batch(watermark, observations=(), *, eof=False, frames=None, sample_rate=10):
+    metadata = {} if sample_rate is None else {"sample_rate_hz": sample_rate}
+    finalized_peaks = tuple(
+        item.timestamp_seconds for item in observations if item.type == "peak"
+    )
+    if finalized_peaks:
+        metadata["finalized_peak_timestamps_seconds"] = finalized_peaks
     return IncrementalAudioBatch(
         "audio",
         tuple(observations),
         watermark,
         round(watermark * 10) if frames is None else frames,
         eof,
-        {} if sample_rate is None else {"sample_rate_hz": sample_rate},
+        metadata,
     )
 
 
@@ -474,6 +480,47 @@ def test_real_audio_diagnostic_window_may_extend_past_batch_watermark(tmp_path):
         )
         for item in report.observations
     )
+
+
+def test_real_finalized_audio_peak_may_advance_past_held_watermark(tmp_path):
+    video = tmp_path / "source.mp4"
+    wav = tmp_path / "audio.wav"
+    video.write_bytes(b"video")
+    samples = [0] * 90 + [32767] + [0] * 39
+    with wave.open(str(wav), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(10)
+        output.writeframes(b"".join(struct.pack("<h", item) for item in samples))
+    audio = IncrementalWavAudioObserver(
+        IncrementalAudioObserverConfig(
+            chunk_frames=10,
+            analysis=AudioObserverConfig(
+                window_seconds=1.0,
+                hop_seconds=0.5,
+                silence_threshold_dbfs=-120.0,
+                peak_threshold=0.9,
+                min_peak_distance_seconds=0.25,
+            ),
+        )
+    )
+    whisper = Session([
+        whisper_batch(5.0), whisper_batch(10.0), whisper_batch(13.0, eof=True)
+    ])
+
+    report = ProductionIncrementalOrchestrator(
+        Renderer(tmp_path),
+        session_id="real-audio-peak-session",
+        audio_observer=audio,
+        whisper_observer=Factory(whisper),
+        artifact_validator=Validator(),
+        candidate_generator=MarkerGenerator(),
+        candidate_scorer=MarkerScorer(),
+        clock=Clock(),
+    ).run(video, wav)
+
+    assert report.status == "completed"
+    assert any(item.observer == "audio" and item.type == "peak" for item in report.observations)
 
 
 def test_observer_failure_stops_progress_and_cleanup_is_deterministic(tmp_path):

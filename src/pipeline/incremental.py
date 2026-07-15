@@ -869,7 +869,7 @@ class IncrementalPrerecordedCoordinator:
             )
             requires_audio_frontier = strict and any(
                 item.observer == "audio"
-                and item.type in {"speaking_intensity", "silence"}
+                and item.type in {"speaking_intensity", "silence", "peak"}
                 for item in result.observations
             )
             processed_frontier = (
@@ -880,12 +880,17 @@ class IncrementalPrerecordedCoordinator:
             for observation in result.observations:
                 end = _observation_end(observation)
                 stability_position = _observation_stability_position(observation)
-                if stability_position > observer_watermark:
+                finalized_audio_peak = (
+                    strict
+                    and observation.observer == "audio"
+                    and observation.type == "peak"
+                )
+                if not finalized_audio_peak and stability_position > observer_watermark:
                     raise ValueError("Observation delta extends beyond its stable watermark.")
                 if (
                     processed_frontier is not None
                     and observation.observer == "audio"
-                    and observation.type in {"speaking_intensity", "silence"}
+                    and observation.type in {"speaking_intensity", "silence", "peak"}
                     and end > processed_frontier
                 ):
                     raise ValueError(
@@ -1387,12 +1392,48 @@ def _validated_audio_processed_frontier(result: ObserverResult) -> float:
 
 def _validate_strict_audio_delta_metadata(results: list[ObserverResult]) -> None:
     for result in results:
-        if any(
-            item.observer == "audio"
-            and item.type in {"speaking_intensity", "silence"}
+        strict_audio = [
+            item
             for item in result.observations
-        ):
+            if item.observer == "audio"
+            and item.type in {"speaking_intensity", "silence", "peak"}
+        ]
+        if strict_audio:
             _validated_audio_processed_frontier(result)
+        peaks = [item for item in strict_audio if item.type == "peak"]
+        if peaks:
+            _validate_finalized_audio_peaks(result, peaks)
+
+
+def _validate_finalized_audio_peaks(
+    result: ObserverResult, peaks: list[Observation]
+) -> None:
+    declared = result.metadata.get("finalized_peak_timestamps_seconds")
+    if not isinstance(declared, (list, tuple)):
+        raise ValueError(
+            "Strict Audio peak deltas require finalized peak timestamp metadata."
+        )
+    values: list[float] = []
+    for value in declared:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ValueError(
+                "Finalized Audio peak timestamps must be finite non-negative numbers."
+            )
+        values.append(float(value))
+    if len(values) != len(set(values)):
+        raise ValueError("Finalized Audio peak timestamps must be unique.")
+    observed = sorted(item.timestamp_seconds for item in peaks)
+    if len(observed) != len(set(observed)):
+        raise ValueError("Audio peak observations must have unique timestamps.")
+    if sorted(values) != observed:
+        raise ValueError(
+            "Audio peak observations must exactly match finalized peak metadata."
+        )
 
 
 def _prefix_at(timeline: FeatureTimeline, requested: float) -> FeatureTimeline:

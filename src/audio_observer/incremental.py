@@ -115,7 +115,7 @@ class IncrementalWavAudioSession:
             frames_processed=self._frames_processed,
             eof=True,
             metadata={
-                **self._base_metadata(),
+                **self._base_metadata(observations),
                 "duration_seconds": duration,
                 "overall_loudness_dbfs": self._overall_loudness(),
                 "peak_amplitude": self._peak_amplitude,
@@ -261,7 +261,7 @@ class IncrementalWavAudioSession:
             watermark_seconds=self._stable_watermark(),
             frames_processed=self._frames_processed,
             eof=eof,
-            metadata=self._base_metadata(),
+            metadata=self._base_metadata(observations),
         )
 
     def _stable_watermark(self) -> float:
@@ -298,12 +298,22 @@ class IncrementalWavAudioSession:
             return MIN_DBFS
         return max(MIN_DBFS, 20.0 * math.log10(rms))
 
-    def _base_metadata(self) -> dict[str, object]:
-        return {
+    def _base_metadata(
+        self, observations: list[Observation] | None = None
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {
             "source_path": str(self._source.path),
             "sample_rate_hz": self._sample_rate,
             "channels": self._channels,
         }
+        finalized_peaks = tuple(
+            item.timestamp_seconds
+            for item in observations or []
+            if item.type == "peak"
+        )
+        if finalized_peaks:
+            metadata["finalized_peak_timestamps_seconds"] = finalized_peaks
+        return metadata
 
 
 class IncrementalWavAudioObserver:
