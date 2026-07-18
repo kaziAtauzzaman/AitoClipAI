@@ -1,6 +1,8 @@
 """Deterministic suppression of substantially overlapping scored candidates."""
 
 from collections.abc import Iterable
+from functools import lru_cache
+from pathlib import Path
 
 from candidate_selection.config import CandidateSelectionConfig
 from candidate_selection.contracts import (
@@ -8,7 +10,7 @@ from candidate_selection.contracts import (
     SuppressedCandidate,
 )
 from candidate_selection.errors import CandidateSelectionError
-from core import ClipCandidate, ClipScore
+from core import ClipCandidate, ClipScore, SelectionPriorityContract
 
 
 class CandidateSelector:
@@ -18,10 +20,24 @@ class CandidateSelector:
         self._config = config or CandidateSelectionConfig()
         self._validate_config()
 
+    @property
+    def selection_priority_contract(self) -> SelectionPriorityContract:
+        """Return the finite priority alphabet used by greedy selection."""
+
+        return self._config.selection_priority
+
     def select(self, scores: Iterable[ClipScore]) -> CandidateSelectionResult:
         """Return deterministic render selections without changing input scores."""
 
-        ranked = sorted(scores, key=_score_ordering_key)
+        try:
+            ranked = sorted(
+                scores,
+                key=lambda score: self._config.selection_priority.ordering_key(
+                    score.overall_score
+                ),
+            )
+        except ValueError as exc:
+            raise CandidateSelectionError(str(exc)) from exc
         selected: list[ClipScore] = []
         suppressed: list[SuppressedCandidate] = []
         for score in ranked:
@@ -74,6 +90,10 @@ class CandidateSelector:
 
     def _validate_config(self) -> None:
         config = self._config
+        if not isinstance(config.selection_priority, SelectionPriorityContract):
+            raise CandidateSelectionError(
+                "Selection priority must be a SelectionPriorityContract."
+            )
         if not 0.0 < config.overlap_ratio_threshold <= 1.0:
             raise CandidateSelectionError(
                 "Overlap ratio threshold must be greater than 0 and at most 1."
@@ -94,8 +114,8 @@ class CandidateSelector:
 
 
 def _overlap(first: ClipCandidate, second: ClipCandidate) -> tuple[float, float]:
-    if first.source_video_path.resolve(strict=False) != (
-        second.source_video_path.resolve(strict=False)
+    if _resolved_source_path(first.source_video_path) != _resolved_source_path(
+        second.source_video_path
     ):
         return 0.0, 0.0
     overlap_seconds = max(
@@ -110,14 +130,8 @@ def _overlap(first: ClipCandidate, second: ClipCandidate) -> tuple[float, float]
     return overlap_seconds, overlap_seconds / shorter_duration
 
 
-def _score_ordering_key(
-    score: ClipScore,
-) -> tuple[float, float, float, str, str]:
-    candidate = score.candidate
-    return (
-        -score.overall_score,
-        candidate.start_seconds,
-        candidate.end_seconds,
-        candidate.reason,
-        str(candidate.source_video_path),
-    )
+@lru_cache(maxsize=256)
+def _resolved_source_path(path: Path) -> Path:
+    """Resolve a repeated source identity once for overlap-heavy streams."""
+
+    return path.resolve(strict=False)

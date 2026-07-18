@@ -72,6 +72,12 @@ class WhisperSessionFactory(Protocol):
 class IncrementalRenderer(Protocol):
     def render_one(self, score: ClipScore, identity: int) -> RenderJob: ...
 
+    def recover_render(
+        self,
+        score: ClipScore,
+        identity: int,
+    ) -> RenderJob | None: ...
+
 
 class IncrementalArtifactValidator(Protocol):
     def validate_jobs(self, jobs: list[RenderJob]) -> list[RenderedArtifactValidation]: ...
@@ -176,31 +182,82 @@ class _InstrumentedRenderer:
         self._renderer = renderer
         self._clock = clock
         self._report = report
+        self._successful_render_identities: set[int] = set()
 
     def render_one(self, score: ClipScore, identity: int) -> RenderJob:
         started = self._clock()
         succeeded = False
+        job: RenderJob | None = None
         try:
             job = self._renderer.render_one(score, identity)
             succeeded = True
-            return replace(
-                job,
-                metadata={**job.metadata, "incremental_render_identity": identity},
-            )
+            return self._incremental_job(job, identity)
         except BaseException as exc:
-            self._report.render_failures.append(
-                IncrementalFailure("render", type(exc).__name__, str(exc), identity)
-            )
+            if job is None:
+                try:
+                    job = self._renderer.recover_render(score, identity)
+                except Exception:
+                    job = None
+            if job is not None:
+                succeeded = True
+            else:
+                self._report.render_failures.append(
+                    IncrementalFailure(
+                        "render",
+                        type(exc).__name__,
+                        str(exc),
+                        identity,
+                    )
+                )
             raise
         finally:
-            self._report.render_timings.append(
-                TimedOperation(
-                    "render",
-                    f"render:{identity}",
-                    max(0.0, self._clock() - started),
-                    succeeded,
-                )
+            self._record_render_timing(
+                identity,
+                max(0.0, self._clock() - started),
+                succeeded,
             )
+
+    def recover_render(
+        self,
+        score: ClipScore,
+        identity: int,
+    ) -> RenderJob | None:
+        started = self._clock()
+        job = self._renderer.recover_render(score, identity)
+        if job is None:
+            return None
+        self._record_render_timing(
+            identity,
+            max(0.0, self._clock() - started),
+            True,
+        )
+        return self._incremental_job(job, identity)
+
+    def _record_render_timing(
+        self,
+        identity: int,
+        elapsed_seconds: float,
+        succeeded: bool,
+    ) -> None:
+        if succeeded and identity in self._successful_render_identities:
+            return
+        self._report.render_timings.append(
+            TimedOperation(
+                "render",
+                f"render:{identity}",
+                elapsed_seconds,
+                succeeded,
+            )
+        )
+        if succeeded:
+            self._successful_render_identities.add(identity)
+
+    @staticmethod
+    def _incremental_job(job: RenderJob, identity: int) -> RenderJob:
+        return replace(
+            job,
+            metadata={**job.metadata, "incremental_render_identity": identity},
+        )
 
 
 class ProductionIncrementalOrchestrator:
@@ -384,19 +441,34 @@ class ProductionIncrementalOrchestrator:
                             batch.eof,
                         ),
                     )
-                duration = eof_durations["audio"]
+                observer_duration = eof_durations["audio"]
                 if not math.isclose(
-                    duration, eof_durations["whisper"], rel_tol=0.0, abs_tol=1e-9
+                    observer_duration,
+                    eof_durations["whisper"],
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
                 ):
                     raise RuntimeError("Audio and Whisper EOF durations do not match.")
+                duration = _authoritative_source_duration(
+                    source_video,
+                    observer_duration,
+                )
+                final_watermarks = {
+                    observer: max(watermark, duration)
+                    for observer, watermark in watermarks.items()
+                }
                 timeline = _empty_timeline(source_video, audio_source, source_id)
                 if not self._flush(
-                    coordinator, timeline, watermarks, duration, report
+                    coordinator,
+                    timeline,
+                    final_watermarks,
+                    duration,
+                    report,
                 ):
                     self._flush(
                         coordinator,
                         timeline,
-                        watermarks,
+                        final_watermarks,
                         duration,
                         report,
                         retrying=True,
@@ -719,6 +791,25 @@ def _authoritative_eof_duration(observer: str, batch) -> float:
             f"{observer} EOF watermark does not match its frame-derived duration."
         )
     return duration
+
+
+def _authoritative_source_duration(source_video: Path, fallback: float) -> float:
+    metadata_path = source_video.with_name(f"{source_video.name}.metadata.json")
+    if not metadata_path.is_file():
+        return fallback
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Acquired source metadata could not be read.") from exc
+    duration = metadata.get("duration") if isinstance(metadata, Mapping) else None
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, int | float)
+        or not math.isfinite(float(duration))
+        or float(duration) <= 0
+    ):
+        raise RuntimeError("Acquired source metadata requires a positive duration.")
+    return float(duration)
 
 
 def _render_identity(job: RenderJob) -> int:

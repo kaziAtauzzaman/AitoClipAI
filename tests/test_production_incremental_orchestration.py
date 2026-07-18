@@ -14,11 +14,13 @@ from audio_observer import (
 from candidate_selection import CandidateSelector
 from candidate_generation import CandidateGenerator
 from candidate_scoring import CandidateScorer
+from clip_rendering import ClipRenderer, ClipRendererConfig
 from core import (
     ClipCandidate,
     ClipScore,
     Observation,
     RenderJob,
+    SelectionPriorityContract,
 )
 from pipeline import (
     ArtifactValidationError,
@@ -31,9 +33,10 @@ from pipeline.incremental import IncrementalPipelineResult
 import pipeline.production_incremental as production_incremental
 from pipeline.contracts import MediaStreamProbe
 from whisper_observer import IncrementalWhisperBatch, finalized_speech_segment_identity
+from incremental_generator_support import DeltaClosedFamilyGeneratorMixin
 
 
-class MarkerGenerator:
+class MarkerGenerator(DeltaClosedFamilyGeneratorMixin):
     maximum_backtrack_seconds = 0.0
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
@@ -75,6 +78,7 @@ class MarkerGenerator:
 
 class MarkerScorer:
     candidate_local_deterministic = True
+    selection_priority_contract = SelectionPriorityContract()
 
     def score(self, candidates):
         return [
@@ -83,7 +87,7 @@ class MarkerScorer:
         ]
 
 
-class EditorialEvidenceGenerator:
+class EditorialEvidenceGenerator(DeltaClosedFamilyGeneratorMixin):
     maximum_backtrack_seconds = 0.0
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
@@ -185,12 +189,108 @@ class Renderer:
         self.fail = fail
         self.fail_identities = set(fail_identities)
         self.calls = []
+        self.completions = {}
 
     def render_one(self, score, identity):
         self.calls.append((score, identity))
         if self.fail or identity in self.fail_identities:
             raise RuntimeError("render failed")
-        return RenderJob(score.candidate, self.output_dir / f"clip-{identity}.mp4")
+        job = RenderJob(score.candidate, self.output_dir / f"clip-{identity}.mp4")
+        self.completions[identity] = job
+        return job
+
+    def recover_render(self, score, identity):
+        job = self.completions.get(identity)
+        if job is not None and job.candidate != score.candidate:
+            raise RuntimeError("Render identity changed candidate ownership.")
+        return job
+
+
+def test_instrumented_renderer_counts_durable_recovery_as_one_success(
+    tmp_path,
+) -> None:
+    class CreatingRunner:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, command):
+            captured = list(command)
+            self.commands.append(captured)
+            Path(captured[-1]).write_bytes(b"rendered")
+            return type(
+                "Completed",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+
+    class InterruptAfterExternalSuccess:
+        def __init__(self, renderer):
+            self.renderer = renderer
+            self.interrupted = False
+
+        def render_one(self, score, identity):
+            self.renderer.render_one(score, identity)
+            if not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+            raise AssertionError("Durable completion must be recovered, not rerendered.")
+
+        def recover_render(self, score, identity):
+            return self.renderer.recover_render(score, identity)
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    score = ClipScore(
+        ClipCandidate(source, 1.0, 2.0, "durable"),
+        0.8,
+        passed_threshold=True,
+    )
+    command_runner = CreatingRunner()
+    durable = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            overwrite_existing=True,
+        ),
+        runner=command_runner,
+        executable_locator=lambda _: "ffmpeg",
+    )
+    report = production_incremental.ProductionIncrementalReport(
+        "running",
+        source,
+        tmp_path / "audio.wav",
+    )
+    renderer = production_incremental._InstrumentedRenderer(
+        InterruptAfterExternalSuccess(durable),
+        lambda: 1.0,
+        report,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        renderer.render_one(score, 1)
+
+    recovered = renderer.recover_render(score, 1)
+    assert recovered is not None
+    assert recovered.metadata["incremental_render_identity"] == 1
+    assert len(command_runner.commands) == 1
+    assert report.render_failures == []
+    assert len(report.render_timings) == 1
+    assert report.render_timings[0].succeeded is True
+
+    restarted_report = production_incremental.ProductionIncrementalReport(
+        "running",
+        source,
+        tmp_path / "audio.wav",
+    )
+    restarted = production_incremental._InstrumentedRenderer(
+        durable,
+        lambda: 2.0,
+        restarted_report,
+    )
+    assert restarted.recover_render(score, 1) is not None
+    assert restarted.recover_render(score, 1) is not None
+    assert len(command_runner.commands) == 1
+    assert len(restarted_report.render_timings) == 1
+    assert restarted_report.render_timings[0].succeeded is True
 
 
 class Validator:
@@ -304,7 +404,7 @@ def test_slower_whisper_blocks_then_multiple_watermarks_render_chronologically(t
     renderer = Renderer(tmp_path)
     report = orchestrator(tmp_path, audio, whisper, renderer).run(*sources(tmp_path))
 
-    assert [item.candidate.reason for item in report.selected_scores] == ["first", "second"]
+    assert [item.candidate.reason for item in report.selected_scores] == ["second", "first"]
     assert [identity for _, identity in renderer.calls] == [1, 2]
     assert report.watermarks == {"audio": 7.0, "whisper": 7.0}
     assert report.status == "completed"
@@ -739,6 +839,84 @@ def test_authoritative_eof_metadata_is_strict(
     assert audio.closed and whisper.closed
 
 
+def test_acquired_source_duration_finalizes_eof_tail_without_changing_observer_positions(
+    tmp_path,
+):
+    class EOFDurationGenerator(MarkerGenerator):
+        def __init__(self):
+            self.final_duration = None
+
+        def generate(self, timeline):
+            if self.final_duration is None:
+                return []
+            return [
+                ClipCandidate(
+                    timeline.media_path,
+                    self.final_duration - 12.0,
+                    self.final_duration,
+                    "authoritative EOF tail",
+                    metadata={"score": 0.8, "contributing_observations": []},
+                )
+            ]
+
+        def finalize_incremental(
+            self,
+            checkpoint,
+            observations,
+            media_duration_seconds,
+        ):
+            self.final_duration = media_duration_seconds
+            return super().finalize_incremental(
+                checkpoint,
+                observations,
+                media_duration_seconds,
+            )
+
+    observer_duration = 8759.5166875
+    frames_processed = 140_152_267
+    video, wav = sources(tmp_path)
+    video.with_name(f"{video.name}.metadata.json").write_text(
+        json.dumps({"duration": 8760.0}),
+        encoding="utf-8",
+    )
+    audio_eof = audio_batch(
+        observer_duration,
+        eof=True,
+        frames=frames_processed,
+        sample_rate=16_000,
+    )
+    whisper_eof = whisper_batch(
+        observer_duration,
+        eof=True,
+        frames=frames_processed,
+        sample_rate=16_000,
+    )
+    generator = EOFDurationGenerator()
+    renderer = Renderer(tmp_path)
+
+    report = orchestrator(
+        tmp_path,
+        Session([audio_eof]),
+        Session([whisper_eof]),
+        renderer,
+        generator=generator,
+    ).run(video, wav)
+
+    assert report.status == "completed"
+    assert generator.final_duration == 8760.0
+    assert report.watermarks == {
+        "audio": observer_duration,
+        "whisper": observer_duration,
+    }
+    assert audio_eof.frames_processed == frames_processed
+    assert whisper_eof.frames_processed == frames_processed
+    assert [
+        (item.candidate.start_seconds, item.candidate.end_seconds)
+        for item in report.selected_scores
+    ] == [(8748.0, 8760.0)]
+    assert [identity for _, identity in renderer.calls] == [1]
+
+
 def test_flush_validates_success_before_later_render_failure(tmp_path):
     class FlushOnlyGenerator(MarkerGenerator):
         maximum_backtrack_seconds = 10.0
@@ -969,7 +1147,7 @@ def test_real_production_components_scale_with_bounded_delta_state(
     assert metrics.candidate_fingerprints <= count * 30
     assert metrics.peak_active_observations <= 105
     assert metrics.peak_active_scores <= 15
-    assert metrics.peak_unresolved_group_size == 1
+    assert metrics.peak_unresolved_group_size == 13
     assert metrics.finalized_scores == count
     assert metrics.immutable_score_fingerprints == count
     assert metrics.completed_render_jobs == count

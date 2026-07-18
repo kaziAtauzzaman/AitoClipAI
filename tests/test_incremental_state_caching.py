@@ -1,11 +1,24 @@
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from aggregation import FeatureAggregator
-from candidate_generation import CandidateGenerationConfig, CandidateGenerator
+from candidate_generation import (
+    CandidateFamilyId,
+    CandidateGenerationAdvance,
+    CandidateGenerationCheckpoint,
+    CandidateGenerationConfig,
+    CandidateGenerator,
+    ClosedCandidateFamily,
+)
 from candidate_scoring import CandidateScorer, CandidateScoringConfig
-from candidate_selection import CandidateSelector
+from candidate_selection import (
+    CandidateSelectionConfig,
+    CandidateSelectionResult,
+    CandidateSelector,
+)
 from core import (
     AggregatedTimeline,
     ClipCandidate,
@@ -14,6 +27,7 @@ from core import (
     Observation,
     ObserverResult,
     RenderJob,
+    SelectionPriorityContract,
     TimelineGroup,
 )
 from pipeline import (
@@ -22,11 +36,14 @@ from pipeline import (
     IncrementalPrerecordedCoordinator,
     ObserverWatermarks,
     ObserverDeltaIdentity,
+    RenderLifecycleState,
 )
+from pipeline.incremental import candidate_fingerprint, score_fingerprint
 from whisper_observer import finalized_speech_segment_identity
+from incremental_generator_support import DeltaClosedFamilyGeneratorMixin
 
 
-class MarkerGenerator:
+class MarkerGenerator(DeltaClosedFamilyGeneratorMixin):
     maximum_backtrack_seconds = 5.0
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
@@ -66,6 +83,7 @@ class MarkerGenerator:
 
 class TrackingScorer:
     candidate_local_deterministic = True
+    selection_priority_contract = SelectionPriorityContract()
 
     def __init__(self):
         self.calls = 0
@@ -89,14 +107,23 @@ class Renderer:
     def __init__(self, root: Path):
         self.root = root
         self.calls = []
+        self.completions = {}
 
     def render_one(self, score, identity):
         self.calls.append((score, identity))
-        return RenderJob(
+        job = RenderJob(
             score.candidate,
             self.root / f"clip-{identity:03d}.mp4",
             metadata={"rank": identity},
         )
+        self.completions[identity] = job
+        return job
+
+    def recover_render(self, score, identity):
+        job = self.completions.get(identity)
+        if job is not None and job.candidate != score.candidate:
+            raise RuntimeError("Render identity changed candidate ownership.")
+        return job
 
 
 def delta_timeline(tmp_path, observations, observer="fixture", metadata=None):
@@ -110,10 +137,29 @@ def delta_timeline(tmp_path, observations, observer="fixture", metadata=None):
     )
 
 
+def multi_delta_timeline(tmp_path, results):
+    return FeatureTimeline(
+        media_path=tmp_path / "source.mp4",
+        audio_path=tmp_path / "audio.wav",
+        timeline_path=tmp_path / "timeline.json",
+        timeline=FeatureAggregator().aggregate(list(results)),
+        metadata={"source_id": "state-cache-fixture"},
+    )
+
+
 def marker(seen, start, end, score, name):
     return Observation(
         float(seen),
         "fixture",
+        "candidate",
+        {"start": start, "end": end, "score": score, "name": name},
+    )
+
+
+def observer_marker(observer, seen, start, end, score, name):
+    return Observation(
+        float(seen),
+        observer,
         "candidate",
         {"start": start, "end": end, "score": score, "name": name},
     )
@@ -208,7 +254,7 @@ def test_audio_diagnostic_interval_may_extend_beyond_stable_watermark(tmp_path):
         audio_identity(0),
     )
 
-    assert coordinator.state_metrics.active_observations == 1
+    assert len(coordinator.result.scores) == 1
 
 
 @pytest.mark.parametrize(
@@ -302,7 +348,8 @@ def test_audio_closed_silence_starting_at_watermark_is_stable(tmp_path):
         audio_identity(0),
     )
 
-    assert coordinator.state_metrics.active_observations == 1
+    assert len(coordinator.result.scores) == 1
+    assert coordinator.result.scores[0].candidate.reason == "closed-silence"
 
 
 @pytest.mark.parametrize(
@@ -371,12 +418,24 @@ def test_audio_boundary_delta_retry_is_idempotent(tmp_path):
     ) == []
 
     assert scorer.candidates == 1
-    assert coordinator.state_metrics.active_observations == 1
+    assert len(coordinator.result.scores) == 1
 
 
 def test_audio_diagnostic_end_is_retained_then_evicted_as_context(tmp_path):
-    coordinator = audio_coordinator(tmp_path)
-    intensity = audio_diagnostic("speaking_intensity", 8.5, 1.0)
+    coordinator = IncrementalPrerecordedCoordinator(
+        CandidateGenerator(),
+        CandidateScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("audio",)),
+    )
+    intensity = Observation(
+        8.5,
+        "audio",
+        "speaking_intensity",
+        {"intensity": 0.8, "loudness_dbfs": -18.0},
+        duration_seconds=1.0,
+    )
     coordinator.advance_delta(
         delta_timeline(
             tmp_path, [intensity], observer="audio", metadata=audio_metadata(100)
@@ -385,16 +444,23 @@ def test_audio_diagnostic_end_is_retained_then_evicted_as_context(tmp_path):
         audio_identity(0),
     )
     assert coordinator.state_metrics.active_observations == 1
+    assert coordinator._generation_checkpoint.retained_observation_count == 1
+    retained = coordinator._generation_checkpoint._open_events[0].observation
+    assert retained.timestamp_seconds == 8.5
+    assert retained.duration_seconds == 1.0
 
     coordinator.advance_delta(
         delta_timeline(
-            tmp_path, [], observer="audio", metadata=audio_metadata(300)
+            tmp_path, [], observer="audio", metadata=audio_metadata(700)
         ),
-        ObserverWatermarks({"audio": 30.0}),
+        ObserverWatermarks({"audio": 70.0}),
         audio_identity(1),
     )
 
     assert coordinator.state_metrics.active_observations == 0
+    assert coordinator.result.scores == []
+    assert coordinator._generation_checkpoint.retained_observation_count == 0
+    assert coordinator._generation_checkpoint.next_family_ordinal == 1
 
 
 def test_finalized_audio_peak_uses_processed_frontier_not_watermark(tmp_path):
@@ -412,7 +478,8 @@ def test_finalized_audio_peak_uses_processed_frontier_not_watermark(tmp_path):
         audio_identity(0),
     )
 
-    assert coordinator.state_metrics.active_observations == 1
+    assert len(coordinator.result.scores) == 1
+    assert coordinator.result.scores[0].candidate.reason == "finalized-peak"
 
 
 def test_audio_peak_beyond_processed_frontier_is_rejected(tmp_path):
@@ -471,7 +538,7 @@ def test_finalized_audio_peak_delta_retry_is_idempotent(tmp_path):
     assert coordinator.advance_delta(
         timeline, ObserverWatermarks({"audio": 84.0}), identity
     ) == []
-    assert coordinator.state_metrics.active_observations == 1
+    assert len(coordinator.result.scores) == 1
 
 
 def test_duplicate_finalized_peak_provenance_is_rejected(tmp_path):
@@ -564,7 +631,7 @@ def test_unique_finalized_peak_timestamps_match_one_to_one(tmp_path):
         audio_identity(0),
     )
 
-    assert coordinator.state_metrics.active_observations == 2
+    assert len(coordinator.result.scores) == 2
 
 
 def test_eof_finalized_peaks_use_same_uniqueness_contract(tmp_path):
@@ -641,7 +708,8 @@ def test_finalized_whisper_speech_may_extend_beyond_held_watermark(tmp_path):
         ObserverWatermarks({"whisper": 150.0}),
         whisper_identity(0),
     )
-    assert coordinator.state_metrics.active_observations == 1
+    assert len(coordinator.result.scores) == 1
+    assert coordinator.result.scores[0].candidate.reason == "finalized speech"
 
 
 def test_undeclared_whisper_speech_beyond_watermark_is_rejected(tmp_path):
@@ -713,7 +781,10 @@ def test_distinct_same_time_finalized_whisper_segments_are_deterministic(tmp_pat
         ObserverWatermarks({"whisper": 150.0}),
         whisper_identity(0),
     )
-    assert coordinator.state_metrics.active_observations == 2
+    assert len(coordinator.result.scores) == 2
+    assert {
+        item.candidate.reason for item in coordinator.result.scores
+    } == {"first wording", "second wording"}
 
 
 def test_finalized_whisper_receipt_retry_and_provenance_hashing(tmp_path):
@@ -788,13 +859,43 @@ def test_finalized_candidate_is_never_rescored_or_refingerprinted(tmp_path):
     assert final.candidate_fingerprints == after_finalization.candidate_fingerprints
 
 
+def test_duplicate_boundaries_with_different_metadata_remain_distinct_families(
+    tmp_path,
+):
+    coordinator = marker_coordinator(tmp_path)
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [
+                marker(1, 0, 5, 0.9, "strong-metadata"),
+                marker(2, 0, 5, 0.8, "weak-metadata"),
+            ],
+        ),
+        ObserverWatermarks({"fixture": 10.0}),
+    )
+
+    result = coordinator.result
+    assert len(result.scores) == 2
+    assert len(result.selected_scores) == 1
+    assert len(result.suppressed) == 1
+    assert {
+        item.candidate.reason for item in result.scores
+    } == {"strong-metadata", "weak-metadata"}
+    assert len(
+        {
+            candidate_fingerprint(item.candidate, "state-cache-fixture")
+            for item in result.scores
+        }
+    ) == 2
+
+
 def test_retroactive_delta_inside_horizon_changes_overlap_winner(tmp_path):
     scorer = TrackingScorer()
     coordinator = marker_coordinator(tmp_path, scorer)
     weak = marker(5, 0, 10, 0.6, "weak")
     strong = marker(7, 1, 11, 0.9, "strong")
 
-    assert coordinator.advance_delta(delta_timeline(tmp_path, [weak]), ObserverWatermarks({"fixture": 7.0})) == []
+    assert coordinator.advance_delta(delta_timeline(tmp_path, [weak]), ObserverWatermarks({"fixture": 6.0})) == []
     assert coordinator.advance_delta(delta_timeline(tmp_path, [strong]), ObserverWatermarks({"fixture": 12.0})) == []
     jobs = coordinator.advance_delta(delta_timeline(tmp_path, []), ObserverWatermarks({"fixture": 16.0}))
 
@@ -820,15 +921,43 @@ def test_unsafe_overlap_group_keeps_earlier_member_until_group_is_final(tmp_path
     assert [item.score.candidate.reason for item in coordinator.result.suppressed] == ["weak"]
 
 
-def test_delta_older_than_retained_revision_horizon_is_rejected(tmp_path):
+def test_delta_behind_committed_observer_frontier_is_rejected_without_raw_horizon(
+    tmp_path,
+):
     coordinator = marker_coordinator(tmp_path)
     coordinator.advance_delta(delta_timeline(tmp_path, []), ObserverWatermarks({"fixture": 30.0}))
 
-    with pytest.raises(ValueError, match="older than the active revision horizon"):
+    with pytest.raises(ValueError, match="accepted observer frontier"):
         coordinator.advance_delta(
-            delta_timeline(tmp_path, [marker(1, 0, 5, 0.8, "too-old")]),
+            delta_timeline(tmp_path, [marker(1, 0, 5, 0.8, "too-late")]),
             ObserverWatermarks({"fixture": 31.0}),
         )
+    assert coordinator.watermark_seconds == 30.0
+
+
+def test_distinct_evidence_ending_at_committed_frontier_cannot_reopen_family(
+    tmp_path,
+):
+    coordinator = marker_coordinator(tmp_path)
+    first = marker(1, 0, 4, 0.8, "first-at-frontier")
+    same_end = marker(1, 0, 5, 0.9, "distinct-at-same-frontier")
+
+    coordinator.advance_delta(
+        delta_timeline(tmp_path, [first]),
+        ObserverWatermarks({"fixture": 1.0}),
+        delta_identity("fixture", 0),
+    )
+    with pytest.raises(ValueError, match="accepted observer frontier"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [same_end]),
+            ObserverWatermarks({"fixture": 2.0}),
+            delta_identity("fixture", 1),
+        )
+
+    assert [item.candidate.reason for item in coordinator.result.scores] == [
+        "first-at-frontier"
+    ]
+    assert len(coordinator._finalized_scores) == 0
 
 
 def test_explicit_delta_identity_is_idempotent_and_rejects_sequence_misuse(tmp_path):
@@ -961,22 +1090,364 @@ def test_finalized_observations_are_excluded_from_later_generator_calls(tmp_path
     assert generator.seen_names == [["finalized"], ["new"]]
 
 
-def test_continuous_overlap_chain_exceeding_declared_bound_is_rejected(tmp_path):
-    coordinator = marker_coordinator(tmp_path)
-    chain = [
-        marker(1, 0, 10, 0.9, "chain-1"),
-        marker(2, 2, 12, 0.8, "chain-2"),
-        marker(3, 4, 14, 0.7, "chain-3"),
-        marker(4, 6, 16, 0.6, "chain-4"),
-    ]
-    with pytest.raises(RuntimeError, match="exceeded the declared finite bound"):
-        coordinator.advance_delta(
-            delta_timeline(tmp_path, chain),
-            ObserverWatermarks({"fixture": 5.0}),
-            delta_identity("fixture", 0),
+def competition_point(index):
+    timestamp = 10.0 + 2.1 * index
+    return Observation(
+        timestamp,
+        "whisper",
+        "speech",
+        {"text": "HIGH CONFIDENCE!", "speaker": None},
+        duration_seconds=0.0,
+        confidence=1.0,
+    )
+
+
+def improving_competition_points(count):
+    return [
+        replace(
+            competition_point(index),
+            confidence=0.80 + 0.19 * index / max(1, count - 1),
         )
-    assert coordinator.state_metrics.active_observations == len(chain)
-    assert coordinator.state_metrics.peak_unresolved_group_size == len(chain)
+        for index in range(count)
+    ]
+
+
+def real_competition_oracle(tmp_path, observations, duration, priority=None):
+    priority = priority or SelectionPriorityContract()
+    timeline = real_observer_timeline(tmp_path, observations, duration)
+    generator = CandidateGenerator()
+    scorer = CandidateScorer(
+        CandidateScoringConfig(
+            passing_score=0.0,
+            selection_priority=priority,
+        )
+    )
+    selector = CandidateSelector(
+        CandidateSelectionConfig(selection_priority=priority)
+    )
+    candidates = generator.generate(timeline)
+    scores = scorer.score(candidates)
+    return timeline, candidates, scores, selector.select(scores)
+
+
+def real_competition_coordinator(tmp_path, priority=None):
+    priority = priority or SelectionPriorityContract()
+    return IncrementalPrerecordedCoordinator(
+        CandidateGenerator(),
+        CandidateScorer(
+            CandidateScoringConfig(
+                passing_score=0.0,
+                selection_priority=priority,
+            )
+        ),
+        CandidateSelector(
+            CandidateSelectionConfig(selection_priority=priority)
+        ),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("whisper",)),
+    )
+
+
+def test_real_thirty_cluster_component_over_sixty_seconds_matches_batch(tmp_path):
+    observations = [competition_point(index) for index in range(30)]
+    duration = 200.0
+    _, candidates, scores, batch = real_competition_oracle(
+        tmp_path, observations, duration
+    )
+    assert len(candidates) == 30
+    assert candidates[-1].end_seconds - candidates[0].start_seconds > 60.0
+    selector = CandidateSelector()
+    assert all(
+        selector.competes(first, second)
+        for first, second in zip(candidates, candidates[1:])
+    )
+
+    coordinator = real_competition_coordinator(tmp_path)
+    last = observations[-1].timestamp_seconds
+    assert coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            observations,
+            "whisper",
+            whisper_metadata(round(last * 10) + 1, observations),
+        ),
+        ObserverWatermarks({"whisper": last}),
+        whisper_identity(0),
+    ) == []
+    jobs = coordinator.advance_delta(
+        delta_timeline(
+            tmp_path, [], "whisper", whisper_metadata(round(duration * 10))
+        ),
+        ObserverWatermarks({"whisper": duration}),
+        whisper_identity(1),
+    )
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path, [], "whisper", whisper_metadata(round(duration * 10))
+        ),
+        IncrementalEOF(duration, ObserverWatermarks({"whisper": duration})),
+        (whisper_identity(2, eof=True),),
+    )
+
+    expected = [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in batch.selected
+    ]
+    assert [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in result.selected_scores
+    ] == expected
+    assert result.scores == scores
+    assert result.selected_scores == batch.selected
+    assert [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in jobs
+    ] == expected
+    assert coordinator.state_metrics.active_scores == 0
+
+
+def test_real_long_competition_chain_is_locally_finalized_with_bounded_state(
+    tmp_path,
+):
+    observations = [competition_point(index) for index in range(180)]
+    duration = observations[-1].timestamp_seconds + 140.0
+    _, candidates, _, batch = real_competition_oracle(
+        tmp_path, observations, duration
+    )
+    assert candidates[-1].end_seconds - candidates[0].start_seconds > 300.0
+    coordinator = real_competition_coordinator(tmp_path)
+    assert coordinator._direct_competition_span_seconds == 60.0
+    assert coordinator._maximum_selection_ownership_span_seconds == (
+        60.0
+        * SelectionPriorityContract().maximum_strictly_improving_chain_length
+    )
+    peak_active = 0
+    rendered_before_eof = 0
+    for sequence, observation in enumerate(observations):
+        frontier = observation.timestamp_seconds
+        rendered_before_eof += len(
+            coordinator.advance_delta(
+                delta_timeline(
+                    tmp_path,
+                    [observation],
+                    "whisper",
+                    whisper_metadata(round(frontier * 10) + 1, [observation]),
+                ),
+                ObserverWatermarks({"whisper": frontier}),
+                whisper_identity(sequence),
+            )
+        )
+        peak_active = max(peak_active, coordinator.state_metrics.active_scores)
+
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path, [], "whisper", whisper_metadata(round(duration * 10))
+        ),
+        IncrementalEOF(duration, ObserverWatermarks({"whisper": duration})),
+        (whisper_identity(len(observations), eof=True),),
+    )
+    expected = [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in batch.selected
+    ]
+    assert rendered_before_eof > 0
+    assert [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in result.selected_scores
+    ] == expected
+    assert peak_active < 40
+    assert coordinator.state_metrics.active_scores == 0
+
+
+def test_real_competition_component_closes_after_true_noncompeting_gap(tmp_path):
+    chain = [competition_point(index) for index in range(30)]
+    gap = Observation(
+        200.0,
+        "whisper",
+        "speech",
+        {"text": "HIGH CONFIDENCE!", "speaker": None},
+        duration_seconds=0.0,
+        confidence=1.0,
+    )
+    duration = 300.0
+    _, _, _, batch = real_competition_oracle(tmp_path, [*chain, gap], duration)
+    coordinator = real_competition_coordinator(tmp_path)
+    last = chain[-1].timestamp_seconds
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            chain,
+            "whisper",
+            whisper_metadata(round(last * 10) + 1, chain),
+        ),
+        ObserverWatermarks({"whisper": last}),
+        whisper_identity(0),
+    )
+    pre_eof = coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [gap],
+            "whisper",
+            whisper_metadata(2000, [gap]),
+        ),
+        ObserverWatermarks({"whisper": 200.0}),
+        whisper_identity(1),
+    )
+    assert len(pre_eof) == len(batch.selected) - 1
+
+    result = coordinator.flush_delta(
+        delta_timeline(tmp_path, [], "whisper", whisper_metadata(3000)),
+        IncrementalEOF(300.0, ObserverWatermarks({"whisper": 300.0})),
+        (whisper_identity(2, eof=True),),
+    )
+    assert [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in result.selected_scores
+    ] == [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in batch.selected
+    ]
+
+
+@pytest.mark.parametrize("count", [60, 100, 180])
+def test_real_improving_priority_chains_match_batch_without_duration_timeout(
+    tmp_path,
+    count,
+):
+    observations = improving_competition_points(count)
+    duration = observations[-1].timestamp_seconds + 140.0
+    _, candidates, scores, batch = real_competition_oracle(
+        tmp_path,
+        observations,
+        duration,
+    )
+    chronological_scores = {
+        candidate_fingerprint(item.candidate, "state-cache-fixture"): (
+            item.overall_score
+        )
+        for item in scores
+    }
+    assert len(candidates) == count
+    assert all(
+        chronological_scores[
+            candidate_fingerprint(first, "state-cache-fixture")
+        ]
+        < chronological_scores[
+            candidate_fingerprint(second, "state-cache-fixture")
+        ]
+        for first, second in zip(candidates, candidates[1:])
+    )
+
+    coordinator = real_competition_coordinator(tmp_path)
+    peak_active = 0
+    for sequence, observation in enumerate(observations):
+        frontier = observation.timestamp_seconds
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [observation],
+                "whisper",
+                whisper_metadata(round(frontier * 10) + 1, [observation]),
+            ),
+            ObserverWatermarks({"whisper": frontier}),
+            whisper_identity(sequence),
+        )
+        peak_active = max(peak_active, coordinator.state_metrics.active_scores)
+    jobs = coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [],
+            "whisper",
+            whisper_metadata(round(duration * 10)),
+        ),
+        ObserverWatermarks({"whisper": duration}),
+        whisper_identity(count),
+    )
+    result = coordinator.flush_delta(
+        delta_timeline(
+            tmp_path,
+            [],
+            "whisper",
+            whisper_metadata(round(duration * 10)),
+        ),
+        IncrementalEOF(duration, ObserverWatermarks({"whisper": duration})),
+        (whisper_identity(count + 1, eof=True),),
+    )
+    expected = [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in batch.selected
+    ]
+    assert [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in result.selected_scores
+    ] == expected
+    assert result.scores == scores
+    assert result.selected_scores == batch.selected
+    rendered = [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in jobs
+    ]
+    assert len(rendered) == len(expected)
+    assert sorted(rendered) == sorted(expected)
+    assert peak_active <= SelectionPriorityContract().rank_count
+    assert coordinator.state_metrics.active_scores == 0
+
+
+def test_real_chain_longer_than_configured_priority_alphabet_repeats_boundedly(
+    tmp_path,
+):
+    priority = SelectionPriorityContract(score_decimal_places=1)
+    count = 60
+    observations = improving_competition_points(count)
+    duration = observations[-1].timestamp_seconds + 140.0
+    _, _, scores, batch = real_competition_oracle(
+        tmp_path,
+        observations,
+        duration,
+        priority,
+    )
+    coordinator = real_competition_coordinator(tmp_path, priority)
+    peak_active = 0
+    for sequence, observation in enumerate(observations):
+        frontier = observation.timestamp_seconds
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [observation],
+                "whisper",
+                whisper_metadata(round(frontier * 10) + 1, [observation]),
+            ),
+            ObserverWatermarks({"whisper": frontier}),
+            whisper_identity(sequence),
+        )
+        peak_active = max(peak_active, coordinator.state_metrics.active_scores)
+    coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [],
+            "whisper",
+            whisper_metadata(round(duration * 10)),
+        ),
+        ObserverWatermarks({"whisper": duration}),
+        whisper_identity(count),
+    )
+    result = coordinator.flush_delta(
+        delta_timeline(tmp_path, [], "whisper", whisper_metadata(round(duration * 10))),
+        IncrementalEOF(duration, ObserverWatermarks({"whisper": duration})),
+        (whisper_identity(count + 1, eof=True),),
+    )
+
+    assert count > priority.rank_count
+    assert [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in result.selected_scores
+    ] == [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in batch.selected
+    ]
+    assert result.scores == scores
+    assert result.selected_scores == batch.selected
+    assert peak_active <= priority.rank_count + 4
 
 
 def test_eof_delta_retry_is_exactly_once_after_render_failure(tmp_path):
@@ -1007,41 +1478,51 @@ def test_eof_delta_retry_is_exactly_once_after_render_failure(tmp_path):
     assert scorer.candidates == 1
     assert len(result.selected_scores) == 1
     assert len(result.render_jobs) == 1
-    with pytest.raises(RuntimeError, match="already been flushed"):
-        coordinator.flush_delta(timeline, eof)
+    retry = coordinator.flush_delta(timeline, eof)
+    assert retry == result
+    assert scorer.candidates == 1
+    assert len(retry.render_jobs) == 1
 
 
-@pytest.mark.parametrize("after_ingest", [False, True])
+@pytest.mark.parametrize("failure_step", ["observer_proposal", "generator_proposal"])
 def test_interruption_around_ingestion_receipt_commit_is_recoverable(
-    tmp_path, monkeypatch, after_ingest
+    tmp_path, monkeypatch, failure_step
 ):
+    generator = CountingGenerator()
     scorer = TrackingScorer()
-    coordinator = marker_coordinator(tmp_path, scorer)
+    coordinator = transaction_coordinator(
+        tmp_path, generator, scorer, Renderer(tmp_path)
+    )
     timeline = delta_timeline(
         tmp_path, [marker(1, 0, 2, 0.8, "transaction")]
     )
     identity = delta_identity("fixture", 0)
-    original = coordinator._ingest_delta
+    coordinator._activate(timeline)
+    before = transaction_state_snapshot(coordinator, generator)
     interrupted = False
 
-    def interrupt_once(*args, **kwargs):
+    def interrupt_once(step):
         nonlocal interrupted
-        if not interrupted:
+        if step == failure_step and not interrupted:
             interrupted = True
-            if after_ingest:
-                original(*args, **kwargs)
             raise KeyboardInterrupt()
-        return original(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "_ingest_delta", interrupt_once)
+    monkeypatch.setattr(coordinator, "_transaction_preparation_step", interrupt_once)
     with pytest.raises(KeyboardInterrupt):
         coordinator.advance_delta(
             timeline, ObserverWatermarks({"fixture": 7.0}), identity
         )
+    assert transaction_state_snapshot(coordinator, generator) == before
+
+    monkeypatch.setattr(
+        coordinator, "_transaction_preparation_step", lambda step: None
+    )
     jobs = coordinator.advance_delta(
         timeline, ObserverWatermarks({"fixture": 7.0}), identity
     )
     assert len(jobs) == 1
+    assert generator.advance_calls == 1
+    assert generator.finalize_calls == 0
     assert scorer.candidates == 1
     assert len(coordinator.result.selected_scores) == 1
 
@@ -1083,6 +1564,1389 @@ def test_interruption_after_successful_render_does_not_duplicate_job_or_report(t
     assert len(result.scores) == 1
 
 
+class CountingGenerator(MarkerGenerator):
+    def __init__(self):
+        self.advance_calls = 0
+        self.finalize_calls = 0
+
+    def advance_incremental(
+        self,
+        checkpoint,
+        observations,
+        stable_through_seconds,
+        observer_frontiers=None,
+    ):
+        self.advance_calls += 1
+        return super().advance_incremental(
+            checkpoint,
+            observations,
+            stable_through_seconds,
+            observer_frontiers,
+        )
+
+    def finalize_incremental(
+        self,
+        checkpoint,
+        observations,
+        media_duration_seconds,
+    ):
+        self.finalize_calls += 1
+        return super().finalize_incremental(
+            checkpoint,
+            observations,
+            media_duration_seconds,
+        )
+
+
+def transaction_timeline(tmp_path):
+    return delta_timeline(
+        tmp_path,
+        [
+            marker(1, 0, 2, 0.81, "first"),
+            marker(10, 10, 12, 0.82, "second"),
+            marker(20, 20, 22, 0.83, "third"),
+        ],
+    )
+
+
+def transaction_coordinator(tmp_path, generator, scorer, renderer):
+    return IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+
+
+def transaction_advance(coordinator, timeline):
+    return coordinator.advance_delta(
+        timeline,
+        ObserverWatermarks({"fixture": 30.0}),
+        delta_identity("fixture", 0),
+    )
+
+
+def transaction_state_snapshot(coordinator, generator):
+    """Snapshot every authoritative value covered by the publication swap."""
+
+    state = coordinator._decision_state
+    result = coordinator.result
+    return {
+        "decision_state_identity": id(state),
+        "generation_checkpoint": state.generation_checkpoint,
+        "observer_watermarks": tuple(state.observer_watermarks.items()),
+        "observer_frontiers": tuple(state.observer_acceptance_frontiers.items()),
+        "observer_frames": tuple(state.observer_frames.items()),
+        "observer_sequences": tuple(state.accepted_delta_sequences.items()),
+        "recent_observation_ids": tuple(
+            (observer, tuple(identities.items()))
+            for observer, identities in state.recent_observation_ids.items()
+        ),
+        "snapshot_observation_ids": state.snapshot_observation_ids,
+        "committed_snapshot": (
+            state.committed_snapshot_payload,
+            state.committed_snapshot_render_start_index,
+            state.committed_snapshot_render_end_index,
+        ),
+        "render_identity": state.render_identity,
+        "render_identities": tuple(state.render_identities.items()),
+        "render_families": tuple(
+            state.render_family_ids_by_fingerprint.items()
+        ),
+        "selected_scores": state.selected_scores,
+        "suppressions": state.suppressions,
+        "finalized_scores": tuple(state.finalized_scores.items()),
+        "active_scores": state.active_scores,
+        "pending_suppressions": state.pending_suppressions,
+        "render_plan": state.pending_render_plan,
+        "committed_receipt": (
+            state.committed_receipt_key,
+            state.committed_receipt_payload,
+        ),
+        "finalized_family_ids": state.finalized_family_ids,
+        "immutable_score_fingerprints": tuple(
+            state.immutable_score_fingerprints.items()
+        ),
+        "score_family_ids": tuple(state.score_family_ids.items()),
+        "cumulative_metrics": (
+            state.generation_passes,
+            state.scored_candidates,
+            state.candidate_fingerprints,
+            state.score_fingerprints,
+            state.peak_active_observations,
+            state.peak_active_scores,
+            state.peak_unresolved_group_size,
+        ),
+        "result": (
+            tuple(result.scores),
+            tuple(result.selected_scores),
+            tuple(result.suppressed),
+            tuple(result.render_jobs),
+        ),
+        "render_states": tuple(coordinator._render_states.items()),
+        "render_completions": tuple(
+            coordinator._authoritative_state.render_completions.items()
+        ),
+        "currently_rendering": frozenset(coordinator._currently_rendering),
+        "completed_delta_receipts": tuple(
+            coordinator._completed_delta_receipts.items()
+        ),
+        "completed_eof_fingerprint": coordinator._completed_eof_fingerprint,
+        "lifecycle": coordinator.lifecycle,
+        "generator": generator.incremental_state_snapshot(),
+    }
+
+
+def test_failure_before_generation_retries_one_generator_transition(
+    tmp_path, monkeypatch
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    original = coordinator._advance_generation
+    interrupted = False
+
+    def interrupt_before_generation(*args, **kwargs):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        coordinator, "_advance_generation", interrupt_before_generation
+    )
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+    assert generator.advance_calls == 0
+    assert coordinator._pending_delta.generation is None
+
+    jobs = transaction_advance(coordinator, timeline)
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert [item.metadata["rank"] for item in jobs] == [1, 2, 3]
+
+
+def test_failure_after_generation_reuses_saved_checkpoint_without_rescoring(
+    tmp_path, monkeypatch
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    original = coordinator._scores_for_closed_families
+    interrupted = False
+
+    def interrupt_after_generation(*args, **kwargs):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        coordinator, "_scores_for_closed_families", interrupt_after_generation
+    )
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+    receipt = coordinator._pending_delta
+    saved_generation = receipt.generation
+    assert saved_generation is not None
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 0
+
+    transaction_advance(coordinator, timeline)
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert coordinator._generation_checkpoint == saved_generation.checkpoint
+
+
+def test_failure_during_scoring_reuses_generation_and_is_deterministic(tmp_path):
+    class FailingScorer(TrackingScorer):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def score(self, candidates):
+            values = list(candidates)
+            self.attempts += 1
+            if self.attempts == 1:
+                raise KeyboardInterrupt()
+            return super().score(values)
+
+    generator = CountingGenerator()
+    scorer = FailingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+    saved_generation = coordinator._pending_delta.generation
+    assert saved_generation is not None
+
+    transaction_advance(coordinator, timeline)
+    assert generator.advance_calls == 1
+    assert scorer.attempts == 2
+    assert scorer.candidates == 3
+    assert coordinator._generation_checkpoint == saved_generation.checkpoint
+
+
+def test_failure_before_decision_commit_reuses_scores_and_family_lineage(
+    tmp_path, monkeypatch
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    original = coordinator._publish_generation_decision
+    interrupted = False
+
+    def interrupt_before_commit(*args, **kwargs):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        coordinator, "_publish_generation_decision", interrupt_before_commit
+    )
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+    receipt = coordinator._pending_delta
+    family_ids = tuple(item.family_id for item in receipt.scores)
+    score_fingerprints = tuple(
+        score_fingerprint(item.score, "state-cache-fixture")
+        for item in receipt.scores
+    )
+    assert receipt.prepared_decisions is not None
+
+    transaction_advance(coordinator, timeline)
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert set(coordinator._finalized_scores) == set(family_ids)
+    assert tuple(
+        score_fingerprint(item, "state-cache-fixture")
+        for item in coordinator.result.scores
+    ) == score_fingerprints
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    [
+        "checkpoint",
+        "render_identities",
+        "selection_results",
+        "score_state",
+        "metrics",
+        "render_plan",
+    ],
+)
+def test_failure_during_decision_preparation_publishes_nothing(
+    tmp_path, monkeypatch, failure_step
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    coordinator._activate(timeline)
+    published = coordinator._decision_state
+    before = transaction_state_snapshot(coordinator, generator)
+
+    def interrupt(step):
+        if step == failure_step:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_decision_preparation_step", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+    receipt = coordinator._pending_delta
+    assert receipt is not None
+    assert receipt.prepared_decisions is not None
+    assert transaction_state_snapshot(coordinator, generator) == before
+    assert coordinator._decision_state is published
+    assert coordinator._generation_checkpoint is published.generation_checkpoint
+    assert coordinator.watermark_seconds == published.watermark_seconds == 0.0
+    assert dict(coordinator._render_identities) == {}
+    assert dict(coordinator._finalized_scores) == {}
+    assert published.active_scores == ()
+    assert published.pending_render_plan == ()
+    assert published.generation_passes == 0
+    assert published.scored_candidates == 0
+    assert published.candidate_fingerprints == 0
+    assert published.score_fingerprints == 0
+    assert coordinator.state_metrics.active_observations == 3
+    assert coordinator.state_metrics.active_scores == 3
+
+    monkeypatch.setattr(coordinator, "_decision_preparation_step", lambda step: None)
+
+    transaction_advance(coordinator, timeline)
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert list(coordinator._render_identities.values()) == [1, 2, 3]
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert len(coordinator.result.selected_scores) == 3
+    assert coordinator._decision_state.pending_render_plan == ()
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    [
+        "observer_proposal",
+        "generator_proposal",
+        "before_commit",
+        "former_generator_commit_gap",
+        "after_state_construction",
+    ],
+)
+def test_cross_component_transaction_failure_has_no_partial_publication(
+    tmp_path, monkeypatch, failure_step
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    coordinator._activate(timeline)
+    before = transaction_state_snapshot(coordinator, generator)
+
+    def interrupt(step):
+        if step == failure_step:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_transaction_preparation_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+
+    assert transaction_state_snapshot(coordinator, generator) == before
+    assert generator.advance_calls == (
+        0 if failure_step == "observer_proposal" else 1
+    )
+    assert scorer.candidates == (
+        3
+        if failure_step
+        in {"before_commit", "former_generator_commit_gap", "after_state_construction"}
+        else 0
+    )
+    assert renderer.calls == []
+
+    receipt = coordinator._pending_delta
+    saved_generation = None if receipt is None else receipt.generation
+    saved_scores = () if receipt is None else tuple(receipt.scores)
+    monkeypatch.setattr(
+        coordinator, "_transaction_preparation_step", lambda step: None
+    )
+    jobs = transaction_advance(coordinator, timeline)
+
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert [item.metadata["rank"] for item in jobs] == [1, 2, 3]
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert len(coordinator.result.selected_scores) == 3
+    assert len(coordinator.result.render_jobs) == 3
+    if saved_generation is not None:
+        assert coordinator._generation_checkpoint is saved_generation.checkpoint
+    if saved_scores:
+        assert tuple(coordinator.result.scores) == tuple(
+            item.score for item in saved_scores
+        )
+
+
+def test_delta_interruption_immediately_after_authoritative_swap_replays_commit(
+    tmp_path, monkeypatch
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "after_commit" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_transaction_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+
+    published = coordinator._decision_state
+    published_metrics = coordinator.state_metrics
+    assert published.committed_receipt_key == coordinator._identity_key(
+        delta_identity("fixture", 0)
+    )
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert renderer.calls == []
+
+    monkeypatch.setattr(
+        coordinator, "_transaction_publication_step", lambda step: None
+    )
+    jobs = transaction_advance(coordinator, timeline)
+    assert [item.metadata["rank"] for item in jobs] == [1, 2, 3]
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert coordinator.state_metrics.generation_passes == (
+        published_metrics.generation_passes
+    )
+    assert coordinator.state_metrics.scored_candidates == (
+        published_metrics.scored_candidates
+    )
+
+    replay = transaction_advance(coordinator, timeline)
+    assert replay == jobs
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert coordinator._pending_delta is None
+    coordinator.advance_delta(
+        delta_timeline(tmp_path, []),
+        ObserverWatermarks({"fixture": 31.0}),
+        delta_identity("fixture", 1),
+    )
+    assert coordinator._accepted_delta_sequences["fixture"] == 1
+    assert coordinator._pending_delta is None
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_delta_completion_ledger_and_pending_clear_publish_together(
+    tmp_path, monkeypatch, boundary
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        expected = "delta_completion" if boundary == "before" else "after_delta_completion"
+        if step == expected and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    hook = (
+        "_completion_preparation_step"
+        if boundary == "before"
+        else "_completion_publication_step"
+    )
+    monkeypatch.setattr(coordinator, hook, interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+
+    key = coordinator._identity_key(delta_identity("fixture", 0))
+    if boundary == "before":
+        assert coordinator._pending_delta is not None
+        assert key not in coordinator._completed_delta_receipts
+    else:
+        assert coordinator._pending_delta is None
+        assert key in coordinator._completed_delta_receipts
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+
+    monkeypatch.setattr(coordinator, hook, lambda step: None)
+    jobs = transaction_advance(coordinator, timeline)
+    assert [item.metadata["rank"] for item in jobs] == [1, 2, 3]
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert coordinator._pending_delta is None
+    assert coordinator._decision_state.pending_render_plan == ()
+    assert key in coordinator._completed_delta_receipts
+
+    coordinator.advance_delta(
+        delta_timeline(tmp_path, []),
+        ObserverWatermarks({"fixture": 31.0}),
+        delta_identity("fixture", 1),
+    )
+    assert coordinator._accepted_delta_sequences["fixture"] == 1
+    assert coordinator._pending_delta is None
+    assert generator.advance_calls == 2
+    assert scorer.candidates == 3
+    assert len(coordinator.result.render_jobs) == 3
+
+
+def test_implicit_delta_retry_recognizes_post_completion_publication(
+    tmp_path, monkeypatch
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = delta_timeline(
+        tmp_path, [marker(1, 0, 2, 0.8, "implicit delta")]
+    )
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "after_delta_completion" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_completion_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.advance_delta(
+            timeline,
+            ObserverWatermarks({"fixture": 7.0}),
+        )
+
+    assert coordinator._pending_delta is None
+    assert [identity for _, identity in renderer.calls] == [1]
+    monkeypatch.setattr(
+        coordinator, "_completion_publication_step", lambda step: None
+    )
+    jobs = coordinator.advance_delta(
+        timeline,
+        ObserverWatermarks({"fixture": 7.0}),
+    )
+    assert len(jobs) == 1
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 1
+    assert [identity for _, identity in renderer.calls] == [1]
+
+
+def test_completed_delta_retry_survives_other_observer_watermark_progress(tmp_path):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+    )
+    audio_timeline = multi_delta_timeline(
+        tmp_path,
+        [
+            ObserverResult(
+                "audio",
+                [observer_marker("audio", 1, 0, 2, 0.81, "audio")],
+            )
+        ],
+    )
+    audio_watermarks = ObserverWatermarks({"audio": 10.0, "whisper": 0.0})
+    audio_identity = delta_identity("audio", 0)
+    first_jobs = coordinator.advance_delta(
+        audio_timeline,
+        audio_watermarks,
+        audio_identity,
+    )
+    assert first_jobs == []
+
+    coordinator.advance_delta(
+        multi_delta_timeline(
+            tmp_path,
+            [
+                ObserverResult(
+                    "whisper",
+                    [
+                        observer_marker(
+                            "whisper", 20, 20, 22, 0.82, "whisper"
+                        )
+                    ],
+                )
+            ],
+        ),
+        ObserverWatermarks({"audio": 10.0, "whisper": 30.0}),
+        delta_identity("whisper", 0),
+    )
+    assert coordinator.watermark_seconds == 10.0
+    before_retry = transaction_state_snapshot(coordinator, generator)
+    calls_before_retry = (
+        generator.advance_calls,
+        scorer.calls,
+        len(renderer.calls),
+    )
+
+    assert coordinator.advance_delta(
+        audio_timeline,
+        audio_watermarks,
+        audio_identity,
+    ) == first_jobs
+    assert transaction_state_snapshot(coordinator, generator) == before_retry
+    assert (
+        generator.advance_calls,
+        scorer.calls,
+        len(renderer.calls),
+    ) == calls_before_retry
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    ["after_render_one", "after_completion_construction", "after_render_completion"],
+)
+def test_render_completion_status_and_job_are_one_retryable_publication(
+    tmp_path, monkeypatch, failure_step
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == failure_step and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_render_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        transaction_advance(coordinator, timeline)
+
+    assert [identity for _, identity in renderer.calls] == [1]
+    assert len(coordinator.result.render_jobs) == 1
+    assert list(coordinator._render_states.values()) == [
+        RenderLifecycleState.RENDERED
+    ]
+
+    monkeypatch.setattr(coordinator, "_render_publication_step", lambda step: None)
+    jobs = transaction_advance(coordinator, timeline)
+    assert [item.metadata["rank"] for item in jobs] == [1, 2, 3]
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert len(coordinator.result.render_jobs) == 3
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+
+
+class DeepCopyScorer(TrackingScorer):
+    def __init__(self):
+        super().__init__()
+        self.input_candidate_ids = []
+        self.output_candidate_ids = []
+
+    def score(self, candidates):
+        values = list(candidates)
+        self.input_candidate_ids.extend(id(item) for item in values)
+        output = deepcopy(super().score(values))
+        self.output_candidate_ids.extend(id(item.candidate) for item in output)
+        return output
+
+
+class DeepCopySelector:
+    selection_priority_contract = SelectionPriorityContract()
+
+    def __init__(self):
+        self.delegate = CandidateSelector()
+        self.input_score_ids = []
+        self.output_score_ids = []
+
+    def select(self, scores):
+        values = list(scores)
+        self.input_score_ids.extend(id(item) for item in values)
+        output = deepcopy(self.delegate.select(values))
+        self.output_score_ids.extend(id(item) for item in output.selected)
+        self.output_score_ids.extend(id(item.score) for item in output.suppressed)
+        return output
+
+
+def test_value_equivalent_scorer_and_selector_dtos_preserve_ownership(tmp_path):
+    generator = CountingGenerator()
+    scorer = DeepCopyScorer()
+    selector = DeepCopySelector()
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        selector,
+        renderer,
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    jobs = transaction_advance(coordinator, transaction_timeline(tmp_path))
+
+    assert len(jobs) == 3
+    assert set(scorer.input_candidate_ids).isdisjoint(scorer.output_candidate_ids)
+    assert set(selector.input_score_ids).isdisjoint(selector.output_score_ids)
+    assert len(coordinator.result.scores) == 3
+    assert len(coordinator.result.selected_scores) == 3
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+
+
+def _score_with_other_source(score, source_path):
+    candidate = score.candidate
+    moved = ClipCandidate(
+        source_path,
+        candidate.start_seconds,
+        candidate.end_seconds,
+        candidate.reason,
+        source_signals=deepcopy(candidate.source_signals),
+        title=candidate.title,
+        metadata=deepcopy(candidate.metadata),
+    )
+    return ClipScore(
+        moved,
+        score.overall_score,
+        score_components=deepcopy(score.score_components),
+        rationale=score.rationale,
+        passed_threshold=score.passed_threshold,
+    )
+
+
+def test_value_equivalent_scorer_cannot_change_source_path(tmp_path):
+    class WrongSourceScorer(TrackingScorer):
+        def score(self, candidates):
+            return [
+                _score_with_other_source(item, tmp_path / "other-source.mp4")
+                for item in super().score(candidates)
+            ]
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        MarkerGenerator(),
+        WrongSourceScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    with pytest.raises(RuntimeError, match="closed-family ownership"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [marker(1, 0, 2, 0.8, "wrong source")]),
+            ObserverWatermarks({"fixture": 30.0}),
+            delta_identity("fixture", 0),
+        )
+
+
+def test_value_equivalent_selector_cannot_change_source_path(tmp_path):
+    class WrongSourceSelector(DeepCopySelector):
+        def select(self, scores):
+            output = super().select(scores)
+            if not output.selected:
+                return output
+            return CandidateSelectionResult(
+                selected=[
+                    _score_with_other_source(
+                        output.selected[0], tmp_path / "other-source.mp4"
+                    ),
+                    *output.selected[1:],
+                ],
+                suppressed=output.suppressed,
+            )
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        MarkerGenerator(),
+        TrackingScorer(),
+        WrongSourceSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    with pytest.raises(RuntimeError, match="score ownership"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [marker(1, 0, 2, 0.8, "wrong source")]),
+            ObserverWatermarks({"fixture": 30.0}),
+            delta_identity("fixture", 0),
+        )
+
+
+def test_duplicate_equal_candidates_keep_occurrence_family_ownership(tmp_path):
+    class DuplicateEqualGenerator(MarkerGenerator):
+        def generate(self, timeline):
+            count = sum(
+                len(result.observations)
+                for result in timeline.timeline.observer_results
+            )
+            candidate = ClipCandidate(
+                timeline.media_path,
+                0.0,
+                8.0,
+                "value-identical duplicate",
+                metadata={"score": 0.8},
+            )
+            return [deepcopy(candidate) for _ in range(count)]
+
+    scorer = DeepCopyScorer()
+    selector = DeepCopySelector()
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        DuplicateEqualGenerator(),
+        scorer,
+        selector,
+        renderer,
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    observations = [
+        marker(1, 0, 1, 0.8, "first occurrence"),
+        marker(2, 10, 11, 0.8, "second occurrence"),
+    ]
+    jobs = coordinator.advance_delta(
+        delta_timeline(tmp_path, observations),
+        ObserverWatermarks({"fixture": 30.0}),
+        delta_identity("fixture", 0),
+    )
+
+    fingerprints = [
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in coordinator.result.scores
+    ]
+    assert len(fingerprints) == 2
+    assert len(set(fingerprints)) == 1
+    shared_score_fingerprint = score_fingerprint(
+        coordinator.result.scores[0], "state-cache-fixture"
+    )
+    assert len(
+        coordinator._decision_state.score_family_ids[shared_score_fingerprint]
+    ) == 2
+    assert len(coordinator.result.selected_scores) == 1
+    assert len(coordinator.result.suppressed) == 1
+    assert len(jobs) == len(renderer.calls) == 1
+
+
+def test_selector_reordered_value_equivalent_winners_are_rejected(tmp_path):
+    class ReorderingSelector(DeepCopySelector):
+        def select(self, scores):
+            output = super().select(scores)
+            if len(output.selected) > 1 and output.suppressed:
+                return CandidateSelectionResult(
+                    selected=list(reversed(output.selected)),
+                    suppressed=output.suppressed,
+                )
+            return output
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        MarkerGenerator(),
+        DeepCopyScorer(),
+        ReorderingSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    values = [
+        marker(1, 0.0, 10.0, 0.9, "first winner"),
+        marker(2, 7.0, 17.0, 0.8, "second winner"),
+        marker(3, 3.5, 13.5, 0.7, "shared loser"),
+    ]
+    with pytest.raises(RuntimeError, match="selection ownership"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, values),
+            ObserverWatermarks({"fixture": 30.0}),
+            delta_identity("fixture", 0),
+        )
+
+
+@pytest.mark.parametrize("mode", ["missing", "additional"])
+def test_scorer_missing_or_additional_value_output_is_rejected(tmp_path, mode):
+    class InvalidCardinalityScorer(TrackingScorer):
+        def score(self, candidates):
+            output = super().score(candidates)
+            return output[:-1] if mode == "missing" else [*output, deepcopy(output[0])]
+
+    coordinator = transaction_coordinator(
+        tmp_path,
+        CountingGenerator(),
+        InvalidCardinalityScorer(),
+        Renderer(tmp_path),
+    )
+    with pytest.raises(RuntimeError, match="one score per closed family"):
+        transaction_advance(coordinator, transaction_timeline(tmp_path))
+
+
+@pytest.mark.parametrize("mode", ["missing", "additional"])
+def test_selector_missing_or_additional_value_output_is_rejected(tmp_path, mode):
+    class InvalidCardinalitySelector(DeepCopySelector):
+        def select(self, scores):
+            values = list(scores)
+            if len(values) == 1:
+                selected = [] if mode == "missing" else [deepcopy(values[0])] * 2
+                return CandidateSelectionResult(selected=selected, suppressed=[])
+            return super().select(values)
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        MarkerGenerator(),
+        TrackingScorer(),
+        InvalidCardinalitySelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    with pytest.raises(RuntimeError, match="selection ownership"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [marker(1, 0, 2, 0.8, "invalid")]),
+            ObserverWatermarks({"fixture": 30.0}),
+            delta_identity("fixture", 0),
+        )
+
+
+@pytest.mark.parametrize("priority", [1, float("nan"), float("inf")])
+def test_online_competition_requires_a_finite_float_priority_domain(
+    tmp_path, priority
+):
+    class InvalidPriorityScorer(TrackingScorer):
+        def score(self, candidates):
+            values = list(candidates)
+            return [
+                ClipScore(values[0], priority, passed_threshold=True)
+            ]
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        MarkerGenerator(),
+        InvalidPriorityScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    with pytest.raises(RuntimeError, match="finite float priorities"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, [marker(1, 0, 2, 0.8, "invalid priority")]),
+            ObserverWatermarks({"fixture": 30.0}),
+            delta_identity("fixture", 0),
+        )
+
+
+def test_coordinator_rejects_mismatched_finite_priority_contracts(tmp_path) -> None:
+    with pytest.raises(ValueError, match="selection-priority contracts differ"):
+        IncrementalPrerecordedCoordinator(
+            CandidateGenerator(),
+            CandidateScorer(
+                CandidateScoringConfig(
+                    selection_priority=SelectionPriorityContract(1)
+                )
+            ),
+            CandidateSelector(),
+            Renderer(tmp_path),
+            IncrementalPipelineConfig(required_observers=("whisper",)),
+        )
+
+
+def eof_transaction_fixture(tmp_path):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        generator,
+        scorer,
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+    )
+    timeline = multi_delta_timeline(
+        tmp_path,
+        [
+            ObserverResult(
+                "audio",
+                [observer_marker("audio", 1, 0, 1, 0.81, "audio-eof")],
+            ),
+            ObserverResult(
+                "whisper",
+                [observer_marker("whisper", 11, 10, 11, 0.82, "whisper-eof")],
+            ),
+        ],
+    )
+    eof = IncrementalEOF(
+        20.0,
+        ObserverWatermarks({"audio": 20.0, "whisper": 20.0}),
+    )
+    identities = (
+        ObserverDeltaIdentity(
+            "state-cache-fixture",
+            "incremental:state-cache-fixture",
+            "audio",
+            0,
+            True,
+        ),
+        ObserverDeltaIdentity(
+            "state-cache-fixture",
+            "incremental:state-cache-fixture",
+            "whisper",
+            0,
+            True,
+        ),
+    )
+    return generator, scorer, renderer, coordinator, timeline, eof, identities
+
+
+def test_multi_observer_eof_validation_failure_does_not_accept_first_observer(
+    tmp_path,
+):
+    (
+        generator,
+        scorer,
+        renderer,
+        coordinator,
+        timeline,
+        eof,
+        identities,
+    ) = eof_transaction_fixture(tmp_path)
+    coordinator._activate(timeline)
+    before = transaction_state_snapshot(coordinator, generator)
+    invalid_identities = (
+        identities[0],
+        ObserverDeltaIdentity(
+            identities[1].source_id,
+            identities[1].session_id,
+            identities[1].observer,
+            1,
+            True,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be 0"):
+        coordinator.flush_delta(timeline, eof, invalid_identities)
+
+    assert transaction_state_snapshot(coordinator, generator) == before
+    assert coordinator._pending_eof is None
+    assert generator.advance_calls == 0
+    assert scorer.candidates == 0
+    assert renderer.calls == []
+
+    result = coordinator.flush_delta(timeline, eof, identities)
+    assert generator.advance_calls == 0
+    assert generator.finalize_calls == 1
+    assert scorer.candidates == 2
+    assert [identity for _, identity in renderer.calls] == [1, 2]
+    assert len(result.scores) == len(result.selected_scores) == 2
+    assert len(result.render_jobs) == 2
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    [
+        "eof_observer:audio",
+        "eof_observer:whisper",
+        "observer_proposal",
+        "generator_proposal",
+        "before_commit",
+        "former_generator_commit_gap",
+        "after_state_construction",
+    ],
+)
+def test_multi_observer_eof_transaction_failure_publishes_nothing(
+    tmp_path, monkeypatch, failure_step
+):
+    (
+        generator,
+        scorer,
+        renderer,
+        coordinator,
+        timeline,
+        eof,
+        identities,
+    ) = eof_transaction_fixture(tmp_path)
+    coordinator._activate(timeline)
+    before = transaction_state_snapshot(coordinator, generator)
+
+    def interrupt(step):
+        if step == failure_step:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_transaction_preparation_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.flush_delta(timeline, eof, identities)
+
+    assert transaction_state_snapshot(coordinator, generator) == before
+    assert generator.finalize_calls == (
+        1
+        if failure_step
+        in {
+            "generator_proposal",
+            "before_commit",
+            "former_generator_commit_gap",
+            "after_state_construction",
+        }
+        else 0
+    )
+    assert scorer.candidates == (
+        2
+        if failure_step
+        in {"before_commit", "former_generator_commit_gap", "after_state_construction"}
+        else 0
+    )
+    assert renderer.calls == []
+
+    receipt = coordinator._pending_eof
+    saved_generation = None if receipt is None else receipt.generation
+    saved_scores = () if receipt is None else tuple(receipt.scores)
+    monkeypatch.setattr(
+        coordinator, "_transaction_preparation_step", lambda step: None
+    )
+    result = coordinator.flush_delta(timeline, eof, identities)
+
+    assert generator.advance_calls == 0
+    assert generator.finalize_calls == 1
+    assert scorer.candidates == 2
+    assert [identity for _, identity in renderer.calls] == [1, 2]
+    assert len(result.scores) == len(result.selected_scores) == 2
+    assert len(result.render_jobs) == 2
+    if saved_generation is not None:
+        assert coordinator._generation_checkpoint is saved_generation.checkpoint
+    if saved_scores:
+        assert tuple(result.scores) == tuple(item.score for item in saved_scores)
+
+
+def test_eof_interruption_immediately_after_authoritative_swap_replays_commit(
+    tmp_path, monkeypatch
+):
+    (
+        generator,
+        scorer,
+        renderer,
+        coordinator,
+        timeline,
+        eof,
+        identities,
+    ) = eof_transaction_fixture(tmp_path)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "after_commit" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_transaction_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.flush_delta(timeline, eof, identities)
+
+    published_metrics = coordinator.state_metrics
+    assert generator.finalize_calls == 1
+    assert scorer.candidates == 2
+    assert renderer.calls == []
+    assert coordinator._decision_state.committed_receipt_key == (
+        coordinator._identity_key(coordinator._pending_eof.identity)
+    )
+
+    monkeypatch.setattr(
+        coordinator, "_transaction_publication_step", lambda step: None
+    )
+    result = coordinator.flush_delta(timeline, eof, identities)
+    assert generator.finalize_calls == 1
+    assert scorer.candidates == 2
+    assert [identity for _, identity in renderer.calls] == [1, 2]
+    assert coordinator.state_metrics.generation_passes == (
+        published_metrics.generation_passes
+    )
+    assert coordinator.state_metrics.scored_candidates == (
+        published_metrics.scored_candidates
+    )
+    retry = coordinator.flush_delta(timeline, eof, identities)
+    assert retry == result
+    assert [identity for _, identity in renderer.calls] == [1, 2]
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_eof_completion_and_pending_clear_publish_together(
+    tmp_path, monkeypatch, boundary
+):
+    (
+        generator,
+        scorer,
+        renderer,
+        coordinator,
+        timeline,
+        eof,
+        identities,
+    ) = eof_transaction_fixture(tmp_path)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        expected = "eof_completion" if boundary == "before" else "after_eof_completion"
+        if step == expected and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    hook = (
+        "_completion_preparation_step"
+        if boundary == "before"
+        else "_completion_publication_step"
+    )
+    monkeypatch.setattr(coordinator, hook, interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.flush_delta(timeline, eof, identities)
+
+    if boundary == "before":
+        assert coordinator._pending_eof is not None
+        assert coordinator.lifecycle.value == "active"
+        assert coordinator._completed_eof_fingerprint is None
+    else:
+        assert coordinator._pending_eof is None
+        assert coordinator.lifecycle.value == "flushed"
+        assert coordinator._completed_eof_fingerprint is not None
+    assert [identity for _, identity in renderer.calls] == [1, 2]
+
+    monkeypatch.setattr(coordinator, hook, lambda step: None)
+    result = coordinator.flush_delta(timeline, eof, identities)
+    assert generator.finalize_calls == 1
+    assert scorer.candidates == 2
+    assert [identity for _, identity in renderer.calls] == [1, 2]
+    assert coordinator._pending_eof is None
+    assert coordinator._decision_state.pending_render_plan == ()
+    assert coordinator.lifecycle.value == "flushed"
+    assert len(result.render_jobs) == 2
+
+
+def test_implicit_eof_identities_survive_interruption_before_completion_swap(
+    tmp_path, monkeypatch
+):
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = Renderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = delta_timeline(
+        tmp_path, [marker(1, 0, 2, 0.8, "implicit eof")]
+    )
+    eof = IncrementalEOF(20.0, ObserverWatermarks({"fixture": 20.0}))
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "eof_completion" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_completion_preparation_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.flush_delta(timeline, eof)
+
+    receipt = coordinator._pending_eof
+    assert receipt is not None
+    assert len(receipt.completed_inputs) == 1
+    assert [identity for _, identity in renderer.calls] == [1]
+
+    monkeypatch.setattr(
+        coordinator, "_completion_preparation_step", lambda step: None
+    )
+    result = coordinator.flush_delta(timeline, eof)
+    assert len(result.render_jobs) == 1
+    assert generator.finalize_calls == 1
+    assert scorer.candidates == 1
+    assert [identity for _, identity in renderer.calls] == [1]
+    assert coordinator._pending_eof is None
+    assert receipt.completed_inputs == []
+
+
+def test_completed_eof_receipt_releases_large_ignored_observation_payload(
+    tmp_path, monkeypatch
+):
+    observations = [
+        Observation(float(index), "fixture", "ignored", {"index": index})
+        for index in range(1000)
+    ]
+    timeline = delta_timeline(tmp_path, observations)
+    eof = IncrementalEOF(1000.0, ObserverWatermarks({"fixture": 1000.0}))
+    identity = delta_identity("fixture", 0, eof=True)
+    coordinator = IncrementalPrerecordedCoordinator(
+        CandidateGenerator(),
+        CandidateScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+
+    def interrupt(step):
+        if step == "render_plan":
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(coordinator, "_decision_preparation_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.flush_delta(timeline, eof, (identity,))
+
+    receipt = coordinator._pending_eof
+    assert receipt is not None
+    assert len(receipt.observations) == 1000
+    assert receipt.generation is not None
+    assert coordinator.state_metrics.active_observations == 1000
+    assert coordinator.state_metrics.peak_active_observations == 1000
+    assert coordinator.lifecycle.value == "active"
+
+    monkeypatch.setattr(coordinator, "_decision_preparation_step", lambda step: None)
+    result = coordinator.flush_delta(timeline, eof, (identity,))
+
+    assert result.scores == []
+    assert result.render_jobs == []
+    assert receipt.observations == ()
+    assert receipt.generation is None
+    assert receipt.scores == []
+    assert receipt.finalized_scores == []
+    assert receipt.next_active_scores == []
+    assert receipt.safe_scores == []
+    assert receipt.prepared_decisions is None
+    assert receipt.pending_renders == ()
+    assert receipt.completed_inputs == []
+    assert coordinator._pending_eof is None
+    assert coordinator._completed_eof_fingerprint == receipt.payload
+    assert coordinator.state_metrics.active_observations == 0
+    assert coordinator.state_metrics.active_scores == 0
+    assert coordinator.state_metrics.peak_active_observations == 1000
+    assert coordinator._decision_state.pending_render_plan == ()
+    assert coordinator.lifecycle.value == "flushed"
+
+
+@pytest.mark.parametrize("failure_identity", [1, 2, 3])
+def test_failure_at_each_render_position_preserves_entire_saved_plan(
+    tmp_path, failure_identity
+):
+    class PositionalFailureRenderer(Renderer):
+        def __init__(self, root):
+            super().__init__(root)
+            self.attempts = []
+            self.failed = False
+
+        def render_one(self, score, identity):
+            self.attempts.append(identity)
+            if identity == failure_identity and not self.failed:
+                self.failed = True
+                raise RuntimeError(f"failed render {identity}")
+            return super().render_one(score, identity)
+
+    generator = CountingGenerator()
+    scorer = TrackingScorer()
+    renderer = PositionalFailureRenderer(tmp_path)
+    coordinator = transaction_coordinator(tmp_path, generator, scorer, renderer)
+    timeline = transaction_timeline(tmp_path)
+    with pytest.raises(RuntimeError, match="failed render"):
+        transaction_advance(coordinator, timeline)
+
+    receipt = coordinator._pending_delta
+    generation = receipt.generation
+    assert generation is not None
+    checkpoint = generation.checkpoint
+    family_ids = tuple(item.family_id for item in receipt.scores)
+    candidate_fingerprints = tuple(
+        candidate_fingerprint(item.score.candidate, "state-cache-fixture")
+        for item in receipt.scores
+    )
+    score_fingerprints = tuple(
+        score_fingerprint(item.score, "state-cache-fixture")
+        for item in receipt.scores
+    )
+    plan = tuple(
+        (item.family_id, fingerprint, identity)
+        for item, fingerprint, identity in receipt.pending_renders
+    )
+    assert [identity for _, _, identity in plan] == [1, 2, 3]
+    with pytest.raises(TypeError):
+        receipt.pending_renders[0] = receipt.pending_renders[0]  # type: ignore[index]
+
+    transaction_advance(coordinator, timeline)
+    expected_attempts = [*range(1, failure_identity + 1), *range(failure_identity, 4)]
+    assert renderer.attempts == expected_attempts
+    assert [identity for _, identity in renderer.calls] == [1, 2, 3]
+    assert generator.advance_calls == 1
+    assert scorer.candidates == 3
+    assert coordinator._generation_checkpoint == checkpoint
+    assert set(coordinator._finalized_scores) == set(family_ids)
+    assert tuple(
+        candidate_fingerprint(item.candidate, "state-cache-fixture")
+        for item in coordinator.result.scores
+    ) == candidate_fingerprints
+    assert tuple(
+        score_fingerprint(item, "state-cache-fixture")
+        for item in coordinator.result.scores
+    ) == score_fingerprints
+    assert dict(coordinator._render_identities) == {
+        family_id: identity for family_id, _, identity in plan
+    }
+    assert len(coordinator.result.selected_scores) == 3
+    assert len(coordinator.result.render_jobs) == 3
+
+
 def speech(timestamp, text):
     return Observation(
         float(timestamp),
@@ -1106,6 +2970,248 @@ def complete_timeline(tmp_path, observations, duration):
         timeline=FeatureAggregator().aggregate(results),
         metadata={"source_id": "state-cache-real-components"},
     )
+
+
+def real_observer_timeline(tmp_path, observations, duration):
+    results = [
+        ObserverResult(
+            "audio",
+            [item for item in observations if item.observer == "audio"],
+            {"duration_seconds": duration},
+        ),
+        ObserverResult(
+            "whisper",
+            [item for item in observations if item.observer == "whisper"],
+            {"duration_seconds": duration},
+        ),
+    ]
+    return FeatureTimeline(
+        media_path=tmp_path / "source.mp4",
+        audio_path=tmp_path / "audio.wav",
+        timeline_path=tmp_path / "timeline.json",
+        timeline=FeatureAggregator().aggregate(results),
+        metadata={"source_id": "state-cache-fixture"},
+    )
+
+
+def test_real_generator_accepts_late_stable_overlap_before_family_closure(
+    tmp_path,
+):
+    first = whisper_speech(0.0, 2.0, "first span")
+    audio = Observation(
+        0.5,
+        "audio",
+        "speaking_intensity",
+        {"intensity": 0.8, "loudness_dbfs": -18.0},
+        duration_seconds=2.0,
+    )
+    late = whisper_speech(1.0, 3.0, "legally late overlap")
+    all_observations = [first, audio, late]
+    batch = CandidateGenerator().generate(
+        real_observer_timeline(tmp_path, all_observations, 90.0)
+    )
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        CandidateGenerator(),
+        CandidateScorer(CandidateScoringConfig(passing_score=0.0)),
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+    )
+    watermarks = ObserverWatermarks({"audio": 200.0, "whisper": 200.0})
+    deltas = [
+        (
+            delta_timeline(
+                tmp_path,
+                [first],
+                "whisper",
+                whisper_metadata(20, [first]),
+            ),
+            whisper_identity(0),
+        ),
+        (
+            delta_timeline(
+                tmp_path,
+                [audio],
+                "audio",
+                audio_metadata(25),
+            ),
+            audio_identity(0),
+        ),
+        (
+            delta_timeline(
+                tmp_path,
+                [late],
+                "whisper",
+                whisper_metadata(30, [late]),
+            ),
+            whisper_identity(1),
+        ),
+        (
+            delta_timeline(tmp_path, [], "audio", audio_metadata(2000)),
+            audio_identity(1),
+        ),
+    ]
+    for index, (delta, identity) in enumerate(deltas):
+        assert coordinator.advance_delta(delta, watermarks, identity) == []
+        assert renderer.calls == []
+        if index == 0:
+            assert coordinator.watermark_seconds == 200.0
+            assert coordinator._generation_checkpoint.observer_frontiers == (
+                ("audio", 0.0),
+                ("whisper", 2.0),
+            )
+            assert coordinator.advance_delta(delta, watermarks, identity) == []
+            assert coordinator._generation_checkpoint.retained_observation_count == 1
+
+    jobs = coordinator.advance_delta(
+        delta_timeline(tmp_path, [], "whisper", whisper_metadata(2000)),
+        watermarks,
+        whisper_identity(2),
+    )
+
+    assert len(batch) == len(jobs) == 1
+    assert jobs[0].candidate == batch[0]
+    assert len(renderer.calls) == 1
+    assert coordinator._generation_checkpoint.observer_frontiers == (
+        ("audio", 200.0),
+        ("whisper", 200.0),
+    )
+    assert coordinator._generation_checkpoint.retained_observation_count == 0
+    assert coordinator.state_metrics.peak_active_observations <= 6
+
+    with pytest.raises(ValueError, match="accepted observer frontier"):
+        coordinator.advance_delta(
+            delta_timeline(
+                tmp_path,
+                [first],
+                "whisper",
+                whisper_metadata(2001, [first]),
+            ),
+            watermarks,
+            whisper_identity(3),
+        )
+    assert len(renderer.calls) == 1
+
+    result = coordinator.flush_delta(
+        delta_timeline(tmp_path, [], "whisper", whisper_metadata(2000)),
+        IncrementalEOF(
+            90.0,
+            watermarks,
+        ),
+    )
+    assert [item.candidate for item in result.scores] == batch
+    assert len(result.render_jobs) == 1
+
+
+def test_audio_diagnostic_end_advances_behind_high_global_watermark(tmp_path):
+    first = Observation(
+        0.0,
+        "audio",
+        "speaking_intensity",
+        {"intensity": 0.8, "loudness_dbfs": -18.0},
+        duration_seconds=2.0,
+    )
+    late = Observation(
+        1.0,
+        "audio",
+        "speaking_intensity",
+        {"intensity": 0.9, "loudness_dbfs": -17.0},
+        duration_seconds=2.0,
+    )
+    batch = CandidateGenerator().generate(
+        real_observer_timeline(tmp_path, [first, late], 90.0)
+    )
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        CandidateGenerator(),
+        CandidateScorer(CandidateScoringConfig(passing_score=0.0)),
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio",)),
+    )
+    watermarks = ObserverWatermarks({"audio": 200.0})
+
+    assert coordinator.advance_delta(
+        delta_timeline(tmp_path, [first], "audio", audio_metadata(20)),
+        watermarks,
+        audio_identity(0),
+    ) == []
+    assert coordinator._generation_checkpoint.observer_frontiers == (("audio", 2.0),)
+    assert coordinator._generation_checkpoint.retained_observation_count == 1
+    assert coordinator.advance_delta(
+        delta_timeline(tmp_path, [late], "audio", audio_metadata(30)),
+        watermarks,
+        audio_identity(1),
+    ) == []
+    assert coordinator._generation_checkpoint.observer_frontiers == (("audio", 3.0),)
+    assert coordinator._generation_checkpoint.retained_observation_count == 2
+
+    jobs = coordinator.advance_delta(
+        delta_timeline(tmp_path, [], "audio", audio_metadata(2000)),
+        watermarks,
+        audio_identity(2),
+    )
+    assert len(batch) == len(jobs) == 1
+    assert jobs[0].candidate == batch[0]
+    assert coordinator._generation_checkpoint.retained_observation_count == 0
+    assert coordinator.state_metrics.active_observations == 0
+    assert coordinator.state_metrics.peak_active_observations <= 4
+
+
+def test_coordinator_eof_accepts_frontier_beyond_duration_and_clamps_candidates(
+    tmp_path,
+):
+    audio = Observation(
+        99.0,
+        "audio",
+        "speaking_intensity",
+        {"intensity": 0.8, "loudness_dbfs": -18.0},
+        duration_seconds=1.0,
+    )
+    whisper = whisper_speech(94.0, 100.0, "tail segment")
+    observations = [audio, whisper]
+    batch = CandidateGenerator().generate(
+        real_observer_timeline(tmp_path, observations, 100.0)
+    )
+    renderer = Renderer(tmp_path)
+    coordinator = IncrementalPrerecordedCoordinator(
+        CandidateGenerator(),
+        CandidateScorer(CandidateScoringConfig(passing_score=0.0)),
+        CandidateSelector(),
+        renderer,
+        IncrementalPipelineConfig(required_observers=("audio", "whisper")),
+    )
+    watermarks = ObserverWatermarks({"audio": 101.0, "whisper": 101.0})
+    assert coordinator.advance_delta(
+        delta_timeline(tmp_path, [audio], "audio", audio_metadata(1010)),
+        watermarks,
+        audio_identity(0),
+    ) == []
+    assert coordinator.advance_delta(
+        delta_timeline(
+            tmp_path,
+            [whisper],
+            "whisper",
+            whisper_metadata(1010, [whisper]),
+        ),
+        watermarks,
+        whisper_identity(0),
+    ) == []
+    assert coordinator._generation_checkpoint.stable_through_seconds == 101.0
+    assert coordinator._generation_checkpoint.observer_frontiers == (
+        ("audio", 101.0),
+        ("whisper", 101.0),
+    )
+
+    result = coordinator.flush_delta(
+        delta_timeline(tmp_path, [], "audio", audio_metadata(1010)),
+        IncrementalEOF(100.0, watermarks),
+    )
+
+    assert [item.candidate for item in result.scores] == batch
+    assert all(item.candidate.end_seconds <= 100.0 for item in result.scores)
+    assert len(result.selected_scores) == len(result.render_jobs) == 1
 
 
 def test_rolling_boundary_and_eof_match_complete_batch_decisions(tmp_path):
@@ -1355,8 +3461,11 @@ def test_below_confidence_overlapping_cluster_survives_until_it_becomes_candidat
         ),
         ObserverWatermarks({"audio": 106.0}),
     )
-    assert coordinator._immutable_through == 54.5
-    assert early_next_cluster in coordinator._active_observations["audio"]
+    checkpoint = coordinator._generation_checkpoint
+    assert checkpoint is not None
+    assert any(
+        event.observation == early_next_cluster for event in checkpoint._open_events
+    )
 
     coordinator.advance_delta(
         delta_timeline(
@@ -1397,44 +3506,134 @@ def test_below_confidence_overlapping_cluster_survives_until_it_becomes_candidat
 
 
 @pytest.mark.parametrize(
-    ("start", "partition", "stable_after"),
-    [
-        (-1.0, 2.0, 2.0),
-        (0.0, -1.0, 2.0),
-        (0.0, 3.0, 2.0),
-        (2.0, 1.0, 3.0),
-        (0.0, float("nan"), 2.0),
-        (0.0, 2.0, float("inf")),
-        ("bad", 2.0, 2.0),
-    ],
+    "malformation", ["family", "checkpoint", "source", "frontier", "owner"]
 )
-def test_malformed_or_inconsistent_revision_contract_is_rejected(
-    tmp_path, start, partition, stable_after
+def test_malformed_or_inconsistent_checkpoint_lineage_is_rejected(
+    tmp_path, malformation
 ):
-    class InvalidRevisionGenerator(MarkerGenerator):
-        @staticmethod
-        def revision_start_seconds(candidate):
-            return start
-
-        @staticmethod
-        def revision_partition_seconds(candidate):
-            return partition
-
-        @staticmethod
-        def revision_stable_after_seconds(candidate):
-            return stable_after
+    class InvalidCheckpointGenerator(MarkerGenerator):
+        def advance_incremental(
+            self,
+            checkpoint,
+            observations,
+            stable_through_seconds,
+            observer_frontiers=None,
+        ):
+            output = super().advance_incremental(
+                checkpoint,
+                observations,
+                stable_through_seconds,
+                observer_frontiers,
+            )
+            if malformation == "family":
+                family = output.closed_families[0]
+                return CandidateGenerationAdvance(
+                    output.checkpoint,
+                    (
+                        ClosedCandidateFamily(
+                            CandidateFamilyId(checkpoint.source_id, 7),
+                            family.candidate,
+                        ),
+                    ),
+                )
+            if malformation == "checkpoint":
+                next_checkpoint = output.checkpoint
+                assert next_checkpoint is not None
+                return CandidateGenerationAdvance(
+                    CandidateGenerationCheckpoint(
+                        next_checkpoint._owner_token,
+                        next_checkpoint.source_id,
+                        next_checkpoint.media_path,
+                        next_checkpoint.stable_through_seconds,
+                        next_checkpoint.next_family_ordinal + 1,
+                        next_checkpoint._open_events,
+                    ),
+                    output.closed_families,
+                )
+            next_checkpoint = output.checkpoint
+            assert next_checkpoint is not None
+            if malformation == "frontier":
+                return CandidateGenerationAdvance(
+                    CandidateGenerationCheckpoint(
+                        next_checkpoint._owner_token,
+                        next_checkpoint.source_id,
+                        next_checkpoint.media_path,
+                        next_checkpoint.stable_through_seconds + 1.0,
+                        next_checkpoint.next_family_ordinal,
+                        next_checkpoint._open_events,
+                    ),
+                    output.closed_families,
+                )
+            if malformation == "owner":
+                return CandidateGenerationAdvance(
+                    CandidateGenerationCheckpoint(
+                        object(),
+                        next_checkpoint.source_id,
+                        next_checkpoint.media_path,
+                        next_checkpoint.stable_through_seconds,
+                        next_checkpoint.next_family_ordinal,
+                        next_checkpoint._open_events,
+                    ),
+                    output.closed_families,
+                )
+            return CandidateGenerationAdvance(
+                CandidateGenerationCheckpoint(
+                    next_checkpoint._owner_token,
+                    "another-source",
+                    next_checkpoint.media_path,
+                    next_checkpoint.stable_through_seconds,
+                    next_checkpoint.next_family_ordinal,
+                    next_checkpoint._open_events,
+                ),
+                output.closed_families,
+            )
 
     coordinator = IncrementalPrerecordedCoordinator(
-        InvalidRevisionGenerator(),
+        InvalidCheckpointGenerator(),
         TrackingScorer(),
         CandidateSelector(),
         Renderer(tmp_path),
         IncrementalPipelineConfig(required_observers=("fixture",)),
     )
-    with pytest.raises(ValueError, match="revision contract"):
+    with pytest.raises(
+        RuntimeError, match="lineage|source ownership|accepted frontier"
+    ):
         coordinator.advance_delta(
             delta_timeline(tmp_path, [marker(1, 0, 2, 0.8, "invalid")]),
             ObserverWatermarks({"fixture": 10.0}),
+        )
+
+
+def test_nonempty_initial_generator_checkpoint_is_rejected(tmp_path):
+    class InvalidStartGenerator(MarkerGenerator):
+        def start_incremental(
+            self, *, source_id, media_path, required_observers=()
+        ):
+            checkpoint = super().start_incremental(
+                source_id=source_id,
+                media_path=media_path,
+                required_observers=required_observers,
+            )
+            return CandidateGenerationCheckpoint(
+                checkpoint._owner_token,
+                checkpoint.source_id,
+                checkpoint.media_path,
+                1.0,
+                1,
+                (),
+            )
+
+    coordinator = IncrementalPrerecordedCoordinator(
+        InvalidStartGenerator(),
+        TrackingScorer(),
+        CandidateSelector(),
+        Renderer(tmp_path),
+        IncrementalPipelineConfig(required_observers=("fixture",)),
+    )
+    with pytest.raises(RuntimeError, match="initial checkpoint was not empty"):
+        coordinator.advance_delta(
+            delta_timeline(tmp_path, []),
+            ObserverWatermarks({"fixture": 1.0}),
         )
 
 
@@ -1444,50 +3643,137 @@ def test_validation_04_replacement_boundaries_never_render_as_old_revisions(tmp_
         maximum_competition_seconds = 0.0
         incremental_deterministic = True
 
+        def __init__(self):
+            self._owner = object()
+            self._committed = None
+            self._pending = None
+            self._publication = None
+
+        @staticmethod
+        def earliest_future_candidate_start_seconds(checkpoint):
+            if checkpoint.next_family_ordinal >= 2:
+                return float("inf")
+            frontier = min(value for _, value in checkpoint._observer_frontiers)
+            return frontier - 70.0
+
+        def start_incremental(
+            self, *, source_id, media_path, required_observers=()
+        ):
+            observers = tuple(required_observers)
+            checkpoint = CandidateGenerationCheckpoint(
+                self._owner,
+                source_id,
+                Path(media_path),
+                0.0,
+                0,
+                (),
+                observers,
+                tuple(sorted((observer, 0.0) for observer in observers)),
+            )
+            self._committed = checkpoint
+            return checkpoint
+
+        def bind_incremental_publication(self, checkpoint, committed_checkpoint):
+            assert checkpoint is self._committed
+            assert callable(committed_checkpoint)
+            self._publication = committed_checkpoint
+
+        def _published_checkpoint(self):
+            if self._publication is None:
+                return self._committed
+            return self._publication()
+
+        def advance_incremental(
+            self,
+            checkpoint,
+            observations,
+            stable_through_seconds,
+            observer_frontiers=None,
+        ):
+            assert checkpoint is self._published_checkpoint()
+            frontiers = tuple(sorted((observer_frontiers or {}).items()))
+            if stable_through_seconds < 170.0:
+                output = CandidateGenerationAdvance(
+                    CandidateGenerationCheckpoint(
+                        self._owner,
+                        checkpoint.source_id,
+                        checkpoint.media_path,
+                        stable_through_seconds,
+                        checkpoint.next_family_ordinal,
+                        (),
+                        checkpoint._required_observers,
+                        frontiers,
+                    ),
+                    (),
+                )
+            else:
+                families = tuple(
+                    ClosedCandidateFamily(
+                        CandidateFamilyId(
+                            checkpoint.source_id,
+                            checkpoint.next_family_ordinal + index,
+                        ),
+                        ClipCandidate(
+                            checkpoint.media_path,
+                            start,
+                            end,
+                            f"revision-{index}",
+                            metadata={"score": 0.8},
+                        ),
+                    )
+                    for index, (start, end) in enumerate(
+                        [(73.0, 108.0), (102.6035, 135.0)]
+                    )
+                )
+                output = CandidateGenerationAdvance(
+                    CandidateGenerationCheckpoint(
+                        self._owner,
+                        checkpoint.source_id,
+                        checkpoint.media_path,
+                        stable_through_seconds,
+                        checkpoint.next_family_ordinal + len(families),
+                        (),
+                        checkpoint._required_observers,
+                        frontiers,
+                    ),
+                    families,
+                )
+            if self._publication is None:
+                self._pending = (checkpoint, output)
+            return output
+
+        def finalize_incremental(self, checkpoint, observations, media_duration_seconds):
+            assert checkpoint is self._published_checkpoint()
+            output = CandidateGenerationAdvance(None, ())
+            if self._publication is None:
+                self._pending = (checkpoint, output)
+            return output
+
+        def commit_incremental(self, checkpoint, advance):
+            assert self._publication is None
+            assert self._pending == (checkpoint, advance)
+            self._committed = advance.checkpoint
+            self._pending = None
+
         @staticmethod
         def generate(timeline):
-            observations = [
-                item
-                for result in timeline.timeline.observer_results
-                for item in result.observations
-            ]
-            final = any(item.value.get("phase") == "final" for item in observations)
-            boundaries = (
-                [(73.0, 108.0), (102.6035, 135.0)]
-                if final
-                else [(85.225, 119.0), (123.0, 156.0)]
-            )
-            return [
-                ClipCandidate(
-                    timeline.media_path,
-                    start,
-                    end,
-                    f"revision-{index}",
-                    metadata={
-                        "score": 0.8,
-                        "revision_start": 50.0 if index == 0 else 100.0,
-                        "revision_partition": 105.0 if index == 0 else 153.0,
-                        "contributing_observations": observations,
-                    },
-                )
-                for index, (start, end) in enumerate(boundaries)
-            ]
+            raise AssertionError("Production continuation must not replay batch history.")
 
         @staticmethod
         def revision_start_seconds(candidate):
-            return candidate.metadata["revision_start"]
+            raise AssertionError("Legacy revision contracts must not be called.")
 
         @staticmethod
         def revision_partition_seconds(candidate):
-            return candidate.metadata["revision_partition"]
+            raise AssertionError("Legacy revision contracts must not be called.")
 
         @staticmethod
         def revision_stable_after_seconds(candidate):
-            return 170.0
+            raise AssertionError("Legacy revision contracts must not be called.")
 
         @staticmethod
         def earliest_unresolved_cluster_start_seconds(timeline, stable):
-            return 50.0 if stable < 170.0 else None
+            raise AssertionError("Legacy revision contracts must not be called.")
 
     initial = Observation(150.0, "fixture", "phase", {"phase": "initial"})
     final = Observation(165.0, "fixture", "phase", {"phase": "final"})

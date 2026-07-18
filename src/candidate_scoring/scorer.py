@@ -1,5 +1,6 @@
 """Deterministic explainable candidate scoring and ranking."""
 
+import math
 from typing import Iterable
 
 from candidate_scoring.config import CandidateScoringConfig
@@ -9,7 +10,12 @@ from candidate_scoring.heuristics import (
     candidate_observations,
     default_heuristics,
 )
-from core import ClipCandidate, ClipScore
+from core import (
+    CANDIDATE_SCORE_DECIMAL_PLACES,
+    ClipCandidate,
+    ClipScore,
+    SelectionPriorityContract,
+)
 
 
 class CandidateScorer:
@@ -32,18 +38,20 @@ class CandidateScorer:
 
         return True
 
+    @property
+    def selection_priority_contract(self) -> SelectionPriorityContract:
+        """Return the finite priority alphabet used for candidate ordering."""
+
+        return self._config.selection_priority
+
     def score(self, candidates: Iterable[ClipCandidate]) -> list[ClipScore]:
         """Return candidates sorted from highest to lowest overall score."""
 
         scored = [self._score_candidate(candidate) for candidate in candidates]
         return sorted(
             scored,
-            key=lambda result: (
-                -result.overall_score,
-                result.candidate.start_seconds,
-                result.candidate.end_seconds,
-                result.candidate.reason,
-                str(result.candidate.source_video_path),
+            key=lambda result: self._config.selection_priority.ordering_key(
+                result.overall_score
             ),
         )
 
@@ -63,14 +71,26 @@ class CandidateScorer:
                 )
             weight = self._config.weights[heuristic.name]
             contribution = result.value * weight / total_weight
-            components[heuristic.name] = round(contribution, 6)
+            components[heuristic.name] = round(
+                contribution,
+                CANDIDATE_SCORE_DECIMAL_PLACES,
+            )
             explanations.append(
                 f"{heuristic.name.replace('_', ' ')}: {result.value:.3f} raw "
                 f"x {weight:.3f} weight / {total_weight:.3f} total = "
                 f"{contribution:.3f} ({result.detail})"
             )
 
-        overall = round(sum(components.values()), 6)
+        overall = min(
+            1.0,
+            max(
+                0.0,
+                round(
+                    sum(components.values()),
+                    CANDIDATE_SCORE_DECIMAL_PLACES,
+                ),
+            ),
+        )
         rationale = f"Overall {overall:.3f}. " + "; ".join(explanations) + "."
         return ClipScore(
             candidate=candidate,
@@ -82,6 +102,10 @@ class CandidateScorer:
 
     def _validate_config(self) -> None:
         config = self._config
+        if not isinstance(config.selection_priority, SelectionPriorityContract):
+            raise CandidateScoringError(
+                "Selection priority must be a SelectionPriorityContract."
+            )
         if not 0.0 <= config.passing_score <= 1.0:
             raise CandidateScoringError("Passing score must be between 0 and 1.")
         if config.supporting_observation_reference <= 0:
@@ -104,6 +128,8 @@ class CandidateScorer:
                 f"Missing configured weights for: {', '.join(missing)}."
             )
         active_weights = [config.weights[item.name] for item in self._heuristics]
+        if any(not math.isfinite(weight) for weight in active_weights):
+            raise CandidateScoringError("Scoring weights must be finite.")
         if any(weight < 0 for weight in active_weights):
             raise CandidateScoringError("Scoring weights cannot be negative.")
         if not active_weights or sum(active_weights) <= 0:

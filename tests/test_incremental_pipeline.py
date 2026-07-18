@@ -13,7 +13,7 @@ from audio_observer import (
 )
 from candidate_generation import CandidateGenerator
 from candidate_scoring import CandidateScorer, CandidateScoringConfig
-from candidate_selection import CandidateSelector
+from candidate_selection import CandidateSelectionResult, CandidateSelector
 from clip_rendering import ClipRenderer, ClipRendererConfig
 from core import (
     AggregatedTimeline,
@@ -23,6 +23,7 @@ from core import (
     Observation,
     ObserverResult,
     RenderJob,
+    SelectionPriorityContract,
     TimelineGroup,
 )
 from decision_engine import EditorialStrengthEvaluator
@@ -43,9 +44,10 @@ from whisper_observer import (
     TranscriptionResult,
     TranscriptionSegment,
 )
+from incremental_generator_support import DeltaClosedFamilyGeneratorMixin
 
 
-class MarkerGenerator:
+class MarkerGenerator(DeltaClosedFamilyGeneratorMixin):
     maximum_backtrack_seconds = 5.0
     maximum_competition_seconds = 5.0
     incremental_deterministic = True
@@ -85,6 +87,7 @@ class MarkerGenerator:
 
 class MarkerScorer:
     candidate_local_deterministic = True
+    selection_priority_contract = SelectionPriorityContract()
 
     def score(self, candidates) -> list[ClipScore]:
         return sorted(
@@ -104,14 +107,23 @@ class RecordingRenderer:
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir
         self.calls: list[tuple[ClipScore, int]] = []
+        self.completions: dict[int, RenderJob] = {}
 
     def render_one(self, score: ClipScore, identity: int) -> RenderJob:
         self.calls.append((score, identity))
-        return RenderJob(
+        job = RenderJob(
             score.candidate,
             self.output_dir / f"clip-{identity:03d}.mp4",
             metadata={"rank": identity},
         )
+        self.completions[identity] = job
+        return job
+
+    def recover_render(self, score: ClipScore, identity: int) -> RenderJob | None:
+        job = self.completions.get(identity)
+        if job is not None and job.candidate != score.candidate:
+            raise RuntimeError("Render identity changed candidate ownership.")
+        return job
 
 
 def feature_timeline(
@@ -437,8 +449,8 @@ class UnsafeGenerator(MarkerGenerator):
     maximum_backtrack_seconds = float("inf")
 
 
-class UnboundedCompetitionGenerator(MarkerGenerator):
-    maximum_competition_seconds = float("inf")
+class MissingFutureFrontierGenerator(MarkerGenerator):
+    earliest_future_candidate_start_seconds = None
 
 
 class GlobalStateScorer(MarkerScorer):
@@ -450,18 +462,49 @@ def test_unsafe_generator_backtracking_is_rejected(tmp_path: Path) -> None:
         coordinator(tmp_path, RecordingRenderer(tmp_path), generator=UnsafeGenerator())
 
 
-def test_unbounded_selector_competition_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="maximum_competition_seconds"):
+def test_generator_without_future_candidate_closure_proof_is_rejected(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="earliest future candidate start"):
         coordinator(
             tmp_path,
             RecordingRenderer(tmp_path),
-            generator=UnboundedCompetitionGenerator(),
+            generator=MissingFutureFrontierGenerator(),
         )
 
 
 def test_global_state_scorer_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="candidate-local"):
         coordinator(tmp_path, RecordingRenderer(tmp_path), scorer=GlobalStateScorer())
+
+
+def test_incremental_components_must_expose_finite_priority_contract(
+    tmp_path: Path,
+) -> None:
+    class MissingPriorityScorer:
+        candidate_local_deterministic = True
+
+        def score(self, candidates):
+            return []
+
+    class MissingPrioritySelector:
+        def select(self, scores):
+            return CandidateSelectionResult([], [])
+
+    with pytest.raises(ValueError, match="scorer must expose"):
+        coordinator(
+            tmp_path,
+            RecordingRenderer(tmp_path),
+            scorer=MissingPriorityScorer(),
+        )
+    with pytest.raises(ValueError, match="selector must expose"):
+        IncrementalPrerecordedCoordinator(
+            MarkerGenerator(),
+            MarkerScorer(),
+            MissingPrioritySelector(),
+            RecordingRenderer(tmp_path),
+            IncrementalPipelineConfig(required_observers=("fixture",)),
+        )
 
 
 def test_fingerprint_is_cross_platform_path_independent() -> None:
@@ -510,6 +553,223 @@ def test_render_retry_reuses_identity_and_output(tmp_path: Path) -> None:
     assert [job.output_path.name for job in jobs] == ["clip-001.mp4"]
 
 
+def test_coordinator_recovers_interrupt_after_renderer_side_effect_return(
+    tmp_path: Path,
+) -> None:
+    class InterruptAfterDurableReturn:
+        def __init__(self, renderer):
+            self.renderer = renderer
+            self.render_calls = 0
+            self.interrupted = False
+
+        def render_one(self, score, identity):
+            self.render_calls += 1
+            job = self.renderer.render_one(score, identity)
+            if not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+            return job
+
+        def recover_render(self, score, identity):
+            return self.renderer.recover_render(score, identity)
+
+    timeline = feature_timeline(
+        tmp_path,
+        [
+            {
+                "seen_at": 1,
+                "start": 0,
+                "end": 5,
+                "score": 0.8,
+                "name": "durable",
+            }
+        ],
+    )
+    runner = CreatingRunner()
+    renderer = InterruptAfterDurableReturn(
+        ClipRenderer(
+            ClipRendererConfig(
+                output_dir=tmp_path / "clips",
+                overwrite_existing=True,
+            ),
+            runner=runner,
+            executable_locator=lambda _: "ffmpeg",
+        )
+    )
+    pipeline = coordinator(tmp_path, renderer)
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.advance(timeline, watermarks(10))
+
+    assert len(pipeline.result.render_jobs) == 1
+    jobs = pipeline.advance(timeline, watermarks(10))
+    assert jobs == pipeline.result.render_jobs
+    assert renderer.render_calls == 1
+    assert len(runner.commands) == 1
+    assert jobs[0].output_path.is_file()
+
+
+def test_snapshot_render_retry_does_not_drop_newer_cumulative_observations(
+    tmp_path: Path,
+) -> None:
+    first = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "first"}],
+    )
+    cumulative = feature_timeline(
+        tmp_path,
+        [
+            {"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "first"},
+            {"seen_at": 11, "start": 10, "end": 15, "score": 0.9, "name": "second"},
+        ],
+    )
+    renderer = FailingOnceRenderer(tmp_path, RuntimeError("failed"))
+    pipeline = coordinator(tmp_path, renderer)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        pipeline.advance(first, watermarks(10))
+    jobs = pipeline.advance(cumulative, watermarks(20))
+
+    assert renderer.attempted_identities == [1, 1, 2]
+    assert [job.output_path.name for job in jobs] == [
+        "clip-001.mp4",
+        "clip-002.mp4",
+    ]
+    assert len(pipeline.result.scores) == 2
+
+
+def test_snapshot_retry_after_decision_swap_does_not_regenerate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    timeline = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "once"}],
+    )
+    renderer = RecordingRenderer(tmp_path)
+    pipeline = coordinator(tmp_path, renderer)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "after_commit" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(pipeline, "_transaction_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.advance(timeline, watermarks(10))
+    assert pipeline.state_metrics.generation_passes == 1
+    assert pipeline.state_metrics.scored_candidates == 1
+    assert renderer.calls == []
+
+    monkeypatch.setattr(
+        pipeline, "_transaction_publication_step", lambda step: None
+    )
+    jobs = pipeline.advance(timeline, watermarks(10))
+    assert len(jobs) == 1
+    assert pipeline.state_metrics.generation_passes == 1
+    assert pipeline.state_metrics.scored_candidates == 1
+    assert len(pipeline.result.scores) == 1
+    assert len(renderer.calls) == 1
+
+
+def test_snapshot_retry_without_render_plan_uses_published_lineage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    timeline = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "pending"}],
+    )
+    renderer = RecordingRenderer(tmp_path)
+    pipeline = coordinator(tmp_path, renderer)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "after_commit" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(pipeline, "_transaction_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.advance(timeline, watermarks(5))
+    assert pipeline._decision_state.pending_render_plan == ()
+    assert pipeline.state_metrics.generation_passes == 1
+    assert pipeline.state_metrics.scored_candidates == 1
+
+    monkeypatch.setattr(
+        pipeline, "_transaction_publication_step", lambda step: None
+    )
+    assert pipeline.advance(timeline, watermarks(5)) == []
+    assert pipeline.state_metrics.generation_passes == 1
+    assert pipeline.state_metrics.scored_candidates == 1
+    assert len(pipeline.result.scores) == 1
+    assert renderer.calls == []
+
+
+def test_snapshot_eof_retry_rejects_changed_unaccepted_observations(
+    tmp_path: Path,
+) -> None:
+    timeline = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "retry"}],
+    )
+    changed = feature_timeline(
+        tmp_path,
+        [
+            {"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "retry"},
+            {"seen_at": 2, "start": 8, "end": 9, "score": 0.7, "name": "changed"},
+        ],
+    )
+    renderer = FailingOnceRenderer(tmp_path, RuntimeError("failed"))
+    pipeline = coordinator(tmp_path, renderer)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        pipeline.flush(timeline, eof(10))
+    with pytest.raises(ValueError, match="Combined EOF receipt"):
+        pipeline.flush(changed, eof(10))
+    result = pipeline.flush(timeline, eof(10))
+
+    assert renderer.attempted_identities == [1, 1]
+    assert len(result.selected_scores) == 1
+    assert len(result.render_jobs) == 1
+
+
+def test_snapshot_eof_retry_after_completion_swap_returns_committed_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    timeline = feature_timeline(
+        tmp_path,
+        [{"seen_at": 1, "start": 0, "end": 5, "score": 0.8, "name": "once"}],
+    )
+    renderer = RecordingRenderer(tmp_path)
+    pipeline = coordinator(tmp_path, renderer)
+    interrupted = False
+
+    def interrupt(step):
+        nonlocal interrupted
+        if step == "after_eof_completion" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(pipeline, "_completion_publication_step", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.flush(timeline, eof(10))
+    assert pipeline.lifecycle is CoordinatorLifecycle.FLUSHED
+    assert len(renderer.calls) == 1
+
+    monkeypatch.setattr(
+        pipeline, "_completion_publication_step", lambda step: None
+    )
+    result = pipeline.flush(timeline, eof(10))
+    assert len(result.scores) == len(result.selected_scores) == 1
+    assert len(result.render_jobs) == 1
+    assert len(renderer.calls) == 1
+
+
 def test_interruption_recovers_rendering_as_retryable(tmp_path: Path) -> None:
     timeline = feature_timeline(
         tmp_path,
@@ -534,8 +794,7 @@ def test_coordinator_lifecycle_is_explicitly_single_use(tmp_path: Path) -> None:
     assert pipeline.lifecycle is CoordinatorLifecycle.FLUSHED
     with pytest.raises(RuntimeError, match="already been flushed"):
         pipeline.advance(timeline, watermarks(1))
-    with pytest.raises(RuntimeError, match="already been flushed"):
-        pipeline.flush(timeline, eof(1))
+    assert pipeline.flush(timeline, eof(1)) == pipeline.result
 
 
 def test_coordinator_rejects_second_source(tmp_path: Path) -> None:
@@ -734,8 +993,12 @@ def test_real_components_replay_matches_batch_after_multiple_watermarks(
 
 
 class CreatingRunner:
+    def __init__(self):
+        self.commands = []
+
     def run(self, command):
         command = list(command)
+        self.commands.append(command)
         Path(command[-1]).write_bytes(b"clip")
         return subprocess.CompletedProcess(command, 0, "", "")
 

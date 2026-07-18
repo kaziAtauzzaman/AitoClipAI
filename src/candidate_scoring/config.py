@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from core import SelectionPriorityContract
+
 
 def default_weights() -> dict[str, float]:
     """Return independent default signal weights."""
@@ -30,3 +32,6 @@ class CandidateScoringConfig:
     question_boost: float = 0.04
     maximum_punctuation_boost: float = 0.20
     uppercase_boost: float = 0.05
+    selection_priority: SelectionPriorityContract = field(
+        default_factory=SelectionPriorityContract
+    )

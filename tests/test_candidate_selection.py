@@ -7,7 +7,7 @@ from candidate_selection import (
     CandidateSelectionError,
     CandidateSelector,
 )
-from core import ClipCandidate, ClipScore
+from core import ClipCandidate, ClipScore, SelectionPriorityContract
 
 
 def score(
@@ -22,6 +22,52 @@ def score(
         overall_score=value,
         passed_threshold=True,
     )
+
+
+def test_selection_priority_contract_is_the_exact_scorer_alphabet() -> None:
+    contract = SelectionPriorityContract()
+
+    assert contract.score_decimal_places == 6
+    assert contract.scale == 1_000_000
+    assert contract.rank_count == 1_000_001
+    assert contract.maximum_strictly_improving_chain_length == 1_000_001
+    assert contract.normalize(0.0) == 0
+    assert contract.normalize(0.123456) == 123_456
+    assert contract.normalize(1.0) == 1_000_000
+    assert contract.identity == (
+        "selection-priority-v1",
+        6,
+        0,
+        1_000_000,
+        "decimal-half-even",
+        "stable-input-order",
+    )
+
+
+def test_selection_priority_rejects_precision_outside_scoring_semantics() -> None:
+    with pytest.raises(ValueError, match="between zero"):
+        SelectionPriorityContract(score_decimal_places=7)
+    with pytest.raises(ValueError, match="between zero"):
+        SelectionPriorityContract(score_decimal_places=-1)
+    with pytest.raises(TypeError, match="integer"):
+        SelectionPriorityContract(score_decimal_places=True)
+
+
+def test_reduced_priority_alphabet_preserves_multiplicity_and_stable_ties(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    priority = SelectionPriorityContract(score_decimal_places=1)
+    first = score(source, 0.0, 1.0, 0.81, "first")
+    second = score(source, 2.0, 3.0, 0.84, "second")
+    duplicate = score(source, 4.0, 5.0, 0.84, "duplicate")
+
+    result = CandidateSelector(
+        CandidateSelectionConfig(selection_priority=priority)
+    ).select([first, second, duplicate])
+
+    assert result.selected == [first, second, duplicate]
+    assert result.suppressed == []
 
 
 def test_selector_suppresses_weaker_substantial_overlap(tmp_path: Path) -> None:
@@ -97,7 +143,7 @@ def test_selector_honors_exact_configured_boundaries(tmp_path: Path) -> None:
     assert result.suppressed[0].overlap_ratio == 0.65
 
 
-def test_selector_uses_existing_stable_score_tie_ordering(tmp_path: Path) -> None:
+def test_selector_preserves_equal_rank_input_order(tmp_path: Path) -> None:
     source = tmp_path / "source.mp4"
     earlier = score(source, 0.0, 10.0, 0.8, "earlier")
     later = score(source, 1.0, 9.0, 0.8, "later")
@@ -105,9 +151,10 @@ def test_selector_uses_existing_stable_score_tie_ordering(tmp_path: Path) -> Non
     first = CandidateSelector().select([later, earlier])
     second = CandidateSelector().select([earlier, later])
 
-    assert first == second
-    assert first.selected == [earlier]
-    assert first.suppressed[0].score is later
+    assert first.selected == [later]
+    assert first.suppressed[0].score is earlier
+    assert second.selected == [earlier]
+    assert second.suppressed[0].score is later
 
 
 def test_selector_does_not_mutate_scores_or_input(tmp_path: Path) -> None:

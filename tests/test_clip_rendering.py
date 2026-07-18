@@ -3,6 +3,7 @@ import json
 import math
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Sequence
 
@@ -324,59 +325,76 @@ def test_successful_qsv_runtime_preflight_is_cached_per_ffmpeg_executable(
     assert command[command.index("-frames:v") + 1] == "1"
 
 
-def test_qsv_cache_reuse_uses_backend_specific_final_path(tmp_path: Path) -> None:
-    source_path = tmp_path / "source.mp4"
-    source_path.write_bytes(b"source")
-    output_dir = tmp_path / "clips"
-    output_dir.mkdir()
-    output_path = output_dir / (
-        "source.clip-001-1000-2000-800000.intel_qsv.mp4"
-    )
-    output_path.write_bytes(b"valid cached qsv artifact")
-    temporary_path = output_path.with_name(f".{output_path.name}.rendering")
-    temporary_path.write_bytes(b"stale partial")
-    runner = FakeRenderRunner()
-    renderer = ClipRenderer(
-        ClipRendererConfig(
-            output_dir=output_dir,
-            renderer_backend=RendererBackend.INTEL_QSV,
-        ),
-        runner=runner,
-        executable_locator=lambda binary: "ffmpeg",
-        qsv_capability_checker=lambda binary: True,
-    )
-
-    job = renderer.render_one(scored_candidate(source_path, 1.0, 2.0, 0.8), 1)
-
-    assert job.output_path == output_path
-    assert job.metadata["reused_existing"] is True
-    assert runner.commands == []
-    assert not temporary_path.exists()
-
-
-def test_renderer_reuses_deterministic_output_when_overwrite_is_disabled(
+def test_qsv_durable_completion_reuses_backend_specific_final_path(
     tmp_path: Path,
 ) -> None:
     source_path = tmp_path / "source.mp4"
     source_path.write_bytes(b"source")
     output_dir = tmp_path / "clips"
-    output_dir.mkdir()
-    output_path = output_dir / "source.clip-001-1000-2000-800000.mp4"
-    output_path.write_bytes(b"existing")
-    temporary_path = output_path.with_name(f".{output_path.name}.rendering")
+    config = ClipRendererConfig(
+        output_dir=output_dir,
+        renderer_backend=RendererBackend.INTEL_QSV,
+    )
+    clip_score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    first_runner = FakeRenderRunner()
+    original = ClipRenderer(
+        config,
+        runner=first_runner,
+        executable_locator=lambda binary: "ffmpeg",
+        qsv_capability_checker=lambda binary: True,
+    ).render_one(clip_score, 1)
+    temporary_path = original.output_path.with_name(
+        f".{original.output_path.name}.rendering"
+    )
+    temporary_path.write_bytes(b"stale partial")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        config,
+        runner=runner,
+        executable_locator=lambda binary: None,
+        qsv_capability_checker=lambda binary: False,
+    )
+
+    job = renderer.render_one(clip_score, 1)
+
+    assert job == original
+    assert job.metadata["reused_existing"] is False
+    assert len(first_runner.commands) == 1
+    assert runner.commands == []
+    assert not temporary_path.exists()
+
+
+def test_renderer_reuses_durable_completion_when_overwrite_is_disabled(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    output_dir = tmp_path / "clips"
+    config = ClipRendererConfig(output_dir=output_dir)
+    clip_score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    first_runner = FakeRenderRunner()
+    original = ClipRenderer(
+        config,
+        runner=first_runner,
+        executable_locator=lambda binary: "ffmpeg",
+    ).render_one(clip_score, 1)
+    temporary_path = original.output_path.with_name(
+        f".{original.output_path.name}.rendering"
+    )
     temporary_path.write_bytes(b"abandoned partial")
     runner = FakeRenderRunner()
     renderer = ClipRenderer(
-        ClipRendererConfig(output_dir=output_dir),
+        config,
         runner=runner,
-        executable_locator=lambda binary: "ffmpeg",
+        executable_locator=lambda binary: None,
     )
 
-    job = renderer.render([scored_candidate(source_path, 1.0, 2.0, 0.8)])[0]
+    job = renderer.render([clip_score])[0]
 
-    assert job.output_path == output_path
-    assert output_path.read_bytes() == b"existing"
-    assert job.metadata["reused_existing"] is True
+    assert job == original
+    assert job.output_path.read_bytes() == b"rendered fixture"
+    assert job.metadata["reused_existing"] is False
+    assert len(first_runner.commands) == 1
     assert runner.commands == []
     assert not temporary_path.exists()
 
@@ -481,6 +499,390 @@ def test_renderer_interruption_cleans_temporary_output(tmp_path: Path) -> None:
     temporary_path = final_path.with_name(f".{final_path.name}.rendering")
     assert not final_path.exists()
     assert not temporary_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("step", "expected_encoder_calls"),
+    [
+        ("after_completion_manifest_construction", 2),
+        ("after_encoder_success_before_final_rename", 1),
+        ("after_final_artifact_publication", 1),
+        ("after_manifest_publication", 1),
+        ("before_renderer_return", 1),
+    ],
+)
+def test_renderer_recovers_every_durable_publication_boundary(
+    tmp_path: Path,
+    step: str,
+    expected_encoder_calls: int,
+) -> None:
+    class InterruptingRenderer(ClipRenderer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.interrupted = False
+
+        def _render_attempt_step(self, current: str) -> None:
+            if current == step and not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    clip_score = scored_candidate(source_path, 2.0, 4.0, 0.8)
+    config = ClipRendererConfig(
+        output_dir=tmp_path / "clips",
+        overwrite_existing=True,
+    )
+    runner = FakeRenderRunner()
+    renderer = InterruptingRenderer(
+        config,
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        renderer.render_one(clip_score, 3)
+
+    recovered = renderer.render_one(clip_score, 3)
+    second_recovery = ClipRenderer(
+        config,
+        runner=FakeRenderRunner(),
+        executable_locator=lambda binary: None,
+    ).recover_render(clip_score, 3)
+
+    assert second_recovery == recovered
+    assert len(runner.commands) == expected_encoder_calls
+    assert recovered.output_path.read_bytes() == b"rendered fixture"
+    assert recovered.metadata["rank"] == 3
+    assert not recovered.output_path.with_name(
+        f".{recovered.output_path.name}.rendering"
+    ).exists()
+    completion_records = list(
+        (recovered.output_path.parent / ".render-completions").glob("*.json")
+    )
+    assert len(completion_records) == 1
+    assert ".prepared." not in completion_records[0].name
+
+
+def test_renderer_discards_corrupt_prepared_artifact_and_retries_encoder(
+    tmp_path: Path,
+) -> None:
+    class InterruptAfterPreparation(ClipRenderer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.interrupt = True
+
+        def _render_attempt_step(self, step: str) -> None:
+            if step == "after_encoder_success_before_final_rename" and self.interrupt:
+                self.interrupt = False
+                raise KeyboardInterrupt
+
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    runner = FakeRenderRunner()
+    renderer = InterruptAfterPreparation(
+        ClipRendererConfig(output_dir=tmp_path / "clips"),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        renderer.render_one(score, 1)
+
+    final_path = tmp_path / "clips" / "source.clip-001-1000-2000-800000.mp4"
+    temporary_path = final_path.with_name(f".{final_path.name}.rendering")
+    temporary_path.write_bytes(b"corrupt")
+    job = renderer.render_one(score, 1)
+
+    assert len(runner.commands) == 2
+    assert job.output_path == final_path
+    assert job.output_path.read_bytes() == b"rendered fixture"
+
+
+def test_renderer_rejects_unverified_or_corrupt_final_artifacts(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    clip_score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    output_dir = tmp_path / "clips"
+    unverified_path = output_dir / "source.clip-001-1000-2000-800000.mp4"
+    output_dir.mkdir()
+    unverified_path.write_bytes(b"partial")
+    runner = FakeRenderRunner()
+
+    with pytest.raises(ClipRenderingError, match="no valid completion manifest"):
+        ClipRenderer(
+            ClipRendererConfig(output_dir=output_dir),
+            runner=runner,
+            executable_locator=lambda binary: "ffmpeg",
+        ).render_one(clip_score, 1)
+
+    assert runner.commands == []
+    unverified_path.unlink()
+    original = ClipRenderer(
+        ClipRendererConfig(output_dir=output_dir, overwrite_existing=True),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    ).render_one(clip_score, 1)
+    original.output_path.write_bytes(b"corrupt")
+
+    with pytest.raises(ClipRenderingError, match="no valid completion manifest"):
+        ClipRenderer(
+            ClipRendererConfig(output_dir=output_dir),
+            runner=FakeRenderRunner(),
+            executable_locator=lambda binary: None,
+        ).recover_render(clip_score, 1)
+
+
+def test_renderer_completion_is_bound_to_source_content(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source-a")
+    clip_score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    config = ClipRendererConfig(
+        output_dir=tmp_path / "clips",
+        overwrite_existing=True,
+    )
+    original_runner = FakeRenderRunner()
+    ClipRenderer(
+        config,
+        runner=original_runner,
+        executable_locator=lambda binary: "ffmpeg",
+    ).render_one(clip_score, 1)
+    source_path.write_bytes(b"source-b")
+    recovery_runner = FakeRenderRunner()
+
+    with pytest.raises(ClipRenderingError, match="already owned"):
+        ClipRenderer(
+            ClipRendererConfig(output_dir=tmp_path / "clips"),
+            runner=recovery_runner,
+            executable_locator=lambda binary: None,
+        ).recover_render(clip_score, 1)
+
+    assert len(original_runner.commands) == 1
+    assert recovery_runner.commands == []
+
+
+def test_renderer_identity_cannot_be_reassigned_within_one_source(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            overwrite_existing=True,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+    first = renderer.render_one(
+        scored_candidate(source_path, 1.0, 2.0, 0.8),
+        1,
+    )
+
+    with pytest.raises(ClipRenderingError, match="already owned"):
+        renderer.render_one(
+            scored_candidate(source_path, 3.0, 4.0, 0.9),
+            1,
+        )
+
+    assert len(runner.commands) == 1
+    assert first.output_path.is_file()
+    assert not (tmp_path / "clips" / "source.clip-001-3000-4000-900000.mp4").exists()
+
+
+def test_renderer_identity_namespace_allows_independent_sources(tmp_path: Path) -> None:
+    first_source = tmp_path / "first.mp4"
+    second_source = tmp_path / "second.mp4"
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            overwrite_existing=True,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+
+    first = renderer.render_one(
+        scored_candidate(first_source, 1.0, 2.0, 0.8),
+        1,
+    )
+    second = renderer.render_one(
+        scored_candidate(second_source, 1.0, 2.0, 0.8),
+        1,
+    )
+
+    assert len(runner.commands) == 2
+    assert first.output_path != second.output_path
+    assert len(list((tmp_path / "clips" / ".render-completions").glob("*.json"))) == 2
+
+
+def test_renderer_rejects_cross_identity_final_path_collision(tmp_path: Path) -> None:
+    first_source = tmp_path / "first" / "source.mp4"
+    second_source = tmp_path / "second" / "source.mp4"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    runner = FakeRenderRunner()
+    renderer = ClipRenderer(
+        ClipRendererConfig(
+            output_dir=tmp_path / "clips",
+            filename_template="shared.{ext}",
+            overwrite_existing=True,
+        ),
+        runner=runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+    first_score = scored_candidate(first_source, 1.0, 2.0, 0.8)
+    second_score = scored_candidate(second_source, 3.0, 4.0, 0.9)
+
+    first = renderer.render_one(first_score, 1)
+    with pytest.raises(ClipRenderingError, match="already owned"):
+        renderer.render_one(second_score, 1)
+
+    assert len(runner.commands) == 1
+    assert first.output_path.read_bytes() == b"rendered fixture"
+    assert renderer.recover_render(first_score, 1) == first
+
+
+def test_renderer_output_path_lock_serializes_cross_identity_collision(
+    tmp_path: Path,
+) -> None:
+    class BlockingRunner(FakeRenderRunner):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def run(self, command):
+            self.started.set()
+            if not self.release.wait(5.0):
+                raise AssertionError("Timed out waiting to release the encoder.")
+            return super().run(command)
+
+    first_source = tmp_path / "first" / "source.mp4"
+    second_source = tmp_path / "second" / "source.mp4"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    config = ClipRendererConfig(
+        output_dir=tmp_path / "clips",
+        filename_template="shared.{ext}",
+        overwrite_existing=True,
+    )
+    first_runner = BlockingRunner()
+    second_runner = FakeRenderRunner()
+    first_renderer = ClipRenderer(
+        config,
+        runner=first_runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+    second_renderer = ClipRenderer(
+        config,
+        runner=second_runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+    first_score = scored_candidate(first_source, 1.0, 2.0, 0.8)
+    second_score = scored_candidate(second_source, 3.0, 4.0, 0.9)
+    first_result: list[RenderJob] = []
+    second_errors: list[BaseException] = []
+
+    first_thread = threading.Thread(
+        target=lambda: first_result.append(first_renderer.render_one(first_score, 1))
+    )
+
+    def render_collision() -> None:
+        try:
+            second_renderer.render_one(second_score, 1)
+        except BaseException as exc:
+            second_errors.append(exc)
+
+    second_thread = threading.Thread(target=render_collision)
+    first_thread.start()
+    assert first_runner.started.wait(5.0)
+    second_thread.start()
+    first_runner.release.set()
+    first_thread.join(5.0)
+    second_thread.join(5.0)
+
+    assert len(first_result) == 1
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], ClipRenderingError)
+    assert "already owned" in str(second_errors[0])
+    assert len(first_runner.commands) == 1
+    assert second_runner.commands == []
+    assert first_result[0].output_path.read_bytes() == b"rendered fixture"
+
+
+def test_renderer_identity_lock_serializes_independent_renderer_instances(
+    tmp_path: Path,
+) -> None:
+    class BlockingRunner(FakeRenderRunner):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def run(self, command):
+            self.started.set()
+            if not self.release.wait(5.0):
+                raise AssertionError("Timed out waiting to release the encoder.")
+            return super().run(command)
+
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    score = scored_candidate(source_path, 1.0, 2.0, 0.8)
+    config = ClipRendererConfig(
+        output_dir=tmp_path / "clips",
+        overwrite_existing=True,
+    )
+    first_runner = BlockingRunner()
+    second_runner = FakeRenderRunner()
+    first_renderer = ClipRenderer(
+        config,
+        runner=first_runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+    second_renderer = ClipRenderer(
+        config,
+        runner=second_runner,
+        executable_locator=lambda binary: "ffmpeg",
+    )
+    jobs = []
+    errors = []
+
+    def render(renderer):
+        try:
+            jobs.append(renderer.render_one(score, 1))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=render, args=(first_renderer,))
+    second_thread = threading.Thread(target=render, args=(second_renderer,))
+    first_thread.start()
+    assert first_runner.started.wait(2.0)
+    second_thread.start()
+    second_thread.join(0.1)
+    assert second_thread.is_alive()
+    first_runner.release.set()
+    first_thread.join(5.0)
+    second_thread.join(5.0)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert len(first_runner.commands) == 1
+    assert second_runner.commands == []
+    assert len(jobs) == 2
+    assert jobs[0] == jobs[1]
 
 
 def test_renderer_requires_ffmpeg_to_create_output(tmp_path: Path) -> None:

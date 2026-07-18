@@ -205,7 +205,9 @@ def test_support_and_diversity_are_normalized_and_capped(tmp_path: Path) -> None
     assert result.overall_score == 1.0
 
 
-def test_scorer_is_deterministic_and_uses_stable_tie_breakers(tmp_path: Path) -> None:
+def test_scorer_is_deterministic_and_preserves_equal_rank_input_order(
+    tmp_path: Path,
+) -> None:
     first = candidate(tmp_path, 5.0, [], reason="later")
     second = candidate(tmp_path, 1.0, [], reason="earlier")
     scorer = CandidateScorer()
@@ -213,7 +215,7 @@ def test_scorer_is_deterministic_and_uses_stable_tie_breakers(tmp_path: Path) ->
     forward = scorer.score([first, second])
     reverse = scorer.score([second, first])
 
-    assert [item.candidate for item in forward] == [second, first]
+    assert [item.candidate for item in forward] == [first, second]
     assert [item.candidate for item in reverse] == [second, first]
     assert [item.overall_score for item in forward] == [0.0, 0.0]
 
@@ -252,9 +254,39 @@ def test_scorer_supports_injected_heuristics(tmp_path: Path) -> None:
     assert "custom deterministic signal" in (result.rationale or "")
 
 
+def test_scorer_normalizes_component_rounding_at_the_priority_range(
+    tmp_path: Path,
+) -> None:
+    class FullHeuristic:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def score(self, clip, observations, config):
+            return ComponentScore(1.0, "full")
+
+    heuristics = [FullHeuristic(f"full-{index}") for index in range(6)]
+    result = CandidateScorer(
+        CandidateScoringConfig(
+            weights={item.name: 1.0 for item in heuristics},
+            passing_score=1.0,
+        ),
+        heuristics=heuristics,
+    ).score([candidate(tmp_path, 0.0, [])])[0]
+
+    assert sum(result.score_components.values()) == pytest.approx(1.000002)
+    assert result.overall_score == 1.0
+    assert result.passed_threshold is True
+
+
 def test_scorer_rejects_invalid_weights_and_heuristic_outputs(tmp_path: Path) -> None:
     with pytest.raises(CandidateScoringError, match="positive"):
         CandidateScorer(CandidateScoringConfig(weights={name: 0.0 for name in default_weights()}))
+    with pytest.raises(CandidateScoringError, match="finite"):
+        CandidateScorer(
+            CandidateScoringConfig(
+                weights={name: float("inf") for name in default_weights()}
+            )
+        )
 
     class InvalidHeuristic:
         name = "invalid"
