@@ -33,6 +33,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+config/facebook-upload.json
 config/youtube-upload.json
 config/youtube-client-secrets*.json
 config/youtube-token*.json

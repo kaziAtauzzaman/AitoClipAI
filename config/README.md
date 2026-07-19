@@ -15,3 +15,16 @@ file. Paths can instead be supplied with:
 
 The client secrets, generated refresh token, and runtime ledger must never be
 committed.
+
+For Facebook Page uploads, copy `facebook-upload.example.json` to the ignored
+`facebook-upload.json`. Keep the Page access token out of that file and supply
+settings with:
+
+- `AITOCLIP_FACEBOOK_PAGE_ID`
+- `AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN`
+- `AITOCLIP_FACEBOOK_GRAPH_API_VERSION`
+- `AITOCLIP_UPLOAD_LEDGER_PATH`
+
+Only Page access tokens are accepted operationally; personal-profile uploads
+are outside this adapter. The Page token and runtime ledger must never be
+committed.

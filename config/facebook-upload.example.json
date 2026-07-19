@@ -1,0 +1,5 @@
+{
+  "graph_api_version": "v25.0",
+  "ledger_path": "../data/uploads/upload-ledger.json",
+  "page_id": "YOUR_NUMERIC_PAGE_ID"
+}

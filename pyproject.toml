@@ -20,6 +20,9 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+facebook = [
+  "requests>=2.32",
+]
 transcription = [
   "openai-whisper",
 ]

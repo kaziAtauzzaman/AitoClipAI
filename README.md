@@ -14,6 +14,7 @@ deterministic post-pipeline heuristic/provenance feedback.
 - `yt-dlp` for URL acquisition
 - Optional `openai-whisper` for real transcription
 - Optional Google API dependencies for YouTube uploading
+- Optional Requests dependency for Facebook Page uploading
 
 Install the project for development with transcription support:
 
@@ -27,6 +28,12 @@ Install the optional YouTube client only when preparing a real upload:
 pip install -e ".[youtube]"
 ```
 
+Install the optional Facebook client only when preparing a real Page upload:
+
+```bash
+pip install -e ".[facebook]"
+```
+
 ## YouTube upload dry run
 
 Plan an upload from an existing rendered clip without credentials or network:
@@ -36,6 +43,24 @@ python -m uploading --clip PATH_TO_CLIP --render-identity RENDER_ID \
   --title "Clip title" --description "Clip description" \
   --privacy-status private --dry-run
 ```
+
+## Facebook Page upload dry run
+
+Plan an unpublished Page video from an existing rendered clip without a Page
+access token or network:
+
+```bash
+python -m uploading.facebook_cli --clip PATH_TO_CLIP \
+  --render-identity RENDER_ID --page-id NUMERIC_PAGE_ID \
+  --title "Clip title" --caption "Clip caption" \
+  --publishing-state unpublished --dry-run
+```
+
+The adapter supports Facebook Pages only. `published` creates an immediately
+published Page video; `unpublished` uploads it without publishing. A real
+upload requires a Page access token in
+`AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN`. The Meta app/user grant must include
+`pages_show_list`, `pages_read_engagement`, and `pages_manage_posts`.
 
 Run the complete automated suite:
 
