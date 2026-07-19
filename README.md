@@ -13,11 +13,28 @@ deterministic post-pipeline heuristic/provenance feedback.
 - FFmpeg and FFprobe available on `PATH`
 - `yt-dlp` for URL acquisition
 - Optional `openai-whisper` for real transcription
+- Optional Google API dependencies for YouTube uploading
 
 Install the project for development with transcription support:
 
 ```bash
 pip install -e ".[dev,transcription]"
+```
+
+Install the optional YouTube client only when preparing a real upload:
+
+```bash
+pip install -e ".[youtube]"
+```
+
+## YouTube upload dry run
+
+Plan an upload from an existing rendered clip without credentials or network:
+
+```bash
+python -m uploading --clip PATH_TO_CLIP --render-identity RENDER_ID \
+  --title "Clip title" --description "Clip description" \
+  --privacy-status private --dry-run
 ```
 
 Run the complete automated suite:

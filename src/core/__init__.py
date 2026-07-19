@@ -16,6 +16,8 @@ from core.contracts import (
     SpeechFeatures,
     TimelineGroup,
     UploadJob,
+    UploadResult,
+    UploadStatus,
     VisionFeatures,
 )
 from core.selection_priority import (
@@ -42,6 +44,8 @@ __all__ = [
     "SelectionPriorityContract",
     "TimelineGroup",
     "UploadJob",
+    "UploadResult",
+    "UploadStatus",
     "VisionFeatures",
     "DEFAULT_SELECTION_PRIORITY_CONTRACT",
 ]

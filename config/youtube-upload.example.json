@@ -1,0 +1,5 @@
+{
+  "client_secrets_path": "youtube-client-secrets.json",
+  "ledger_path": "../data/uploads/upload-ledger.json",
+  "token_path": "youtube-token.json"
+}

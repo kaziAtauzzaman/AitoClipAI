@@ -12,6 +12,8 @@ from core import (
     RenderJob,
     SpeechFeatures,
     UploadJob,
+    UploadResult,
+    UploadStatus,
     VisionFeatures,
 )
 
@@ -28,6 +30,7 @@ def test_core_contracts_are_dataclasses() -> None:
         RenderJob,
         SpeechFeatures,
         UploadJob,
+        UploadResult,
         VisionFeatures,
     ]
 
@@ -117,10 +120,20 @@ def test_clip_score_render_and_upload_jobs_share_candidate(tmp_path: Path) -> No
     )
     upload_job = UploadJob(
         rendered_clip_path=render_job.output_path,
+        rendered_clip_identity="render:test:1",
         destination="example-platform",
         title="Example Clip",
+    )
+    upload_result = UploadResult(
+        upload_identity="example-platform:sha256:abc",
+        rendered_clip_identity=upload_job.rendered_clip_identity,
+        rendered_clip_path=upload_job.rendered_clip_path,
+        destination=upload_job.destination,
+        status=UploadStatus.COMPLETED,
+        remote_id="remote-1",
     )
 
     assert score.candidate == candidate
     assert render_job.candidate == candidate
     assert upload_job.rendered_clip_path == render_job.output_path
+    assert upload_result.rendered_clip_identity == upload_job.rendered_clip_identity

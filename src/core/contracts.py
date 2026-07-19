@@ -6,6 +6,7 @@ upload modules so each stage can evolve behind a stable interface.
 """
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -350,6 +351,13 @@ class RenderJob:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class UploadStatus(str, Enum):
+    """Terminal outcome of one platform-neutral upload operation."""
+
+    DRY_RUN = "dry_run"
+    COMPLETED = "completed"
+
+
 @dataclass(frozen=True, slots=True)
 class UploadJob:
     """Upload contract for publishing or exporting a rendered clip.
@@ -359,6 +367,7 @@ class UploadJob:
 
     Attributes:
         rendered_clip_path: Local path to the rendered clip.
+        rendered_clip_identity: Stable identity assigned by rendering.
         destination: Target platform or export destination.
         title: Upload title.
         description: Upload description.
@@ -369,10 +378,26 @@ class UploadJob:
     """
 
     rendered_clip_path: Path
+    rendered_clip_identity: str
     destination: str
     title: str
     description: str | None = None
     tags: list[str] = field(default_factory=list)
     scheduled_time: str | None = None
     visibility: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class UploadResult:
+    """Platform-neutral result for a planned or completed upload."""
+
+    upload_identity: str
+    rendered_clip_identity: str
+    rendered_clip_path: Path
+    destination: str
+    status: UploadStatus
+    remote_id: str | None = None
+    remote_url: str | None = None
+    recovered: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)

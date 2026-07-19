@@ -33,6 +33,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+config/youtube-upload.json
+config/youtube-client-secrets*.json
+config/youtube-token*.json
 
 # Runtime data
 data/downloads/*
@@ -41,6 +44,7 @@ data/captions/*
 data/logs/*
 data/audio/*
 data/validation/*
+data/uploads/*
 models/*
 
 # Preserve documented placeholder files
@@ -49,4 +53,5 @@ models/*
 !data/captions/README.md
 !data/logs/README.md
 !data/audio/README.md
+!data/uploads/README.md
 !models/README.md
