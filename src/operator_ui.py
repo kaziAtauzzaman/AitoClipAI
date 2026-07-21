@@ -36,6 +36,17 @@ START_PROCESSING_MESSAGE = (
     "Start Processing is not connected in the Build Week interface. "
     "Use Demo Mode to inspect the completed Validation 06 run."
 )
+START_BUTTON_LABEL = "Prototype 1 Pipeline · Disabled for Demo"
+INITIAL_PROOF_ROWS = (
+    ("observations", "18,939 observations"),
+    ("generated", "176 generated"),
+    ("passing", "174 passing"),
+    ("selected", "174 selected"),
+    ("rendered", "174 rendered"),
+    ("before_eof", "172 rendered before EOF"),
+    ("youtube", "✓ YouTube upload validated"),
+    ("facebook", "✓ Facebook upload validated"),
+)
 
 
 class DemoDataError(RuntimeError):
@@ -328,8 +339,9 @@ class AitoClipOperatorApp:
         controls.grid(row=4, column=0, sticky="ew", pady=(0, 18))
         ttk.Button(
             controls,
-            text="Start Processing · Not Connected",
+            text=START_BUTTON_LABEL,
             command=self.start_processing,
+            state="disabled",
             style="Secondary.TButton",
         ).pack(side="left", padx=(0, 8))
         self.demo_button = ttk.Button(
@@ -389,18 +401,8 @@ class AitoClipOperatorApp:
         ttk.Label(proof, text="VALIDATION 06 PROOF", style="Section.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 14)
         )
-        proof_rows = (
-            ("observations", "observations"),
-            ("generated", "generated"),
-            ("passing", "passing"),
-            ("selected", "selected"),
-            ("rendered", "rendered"),
-            ("before_eof", "rendered before EOF"),
-            ("youtube", "YouTube upload validated"),
-            ("facebook", "Facebook upload validated"),
-        )
-        for row, (key, label) in enumerate(proof_rows, start=1):
-            value = tk.StringVar(value=f"— {label}")
+        for row, (key, label) in enumerate(INITIAL_PROOF_ROWS, start=1):
+            value = tk.StringVar(value=label)
             self._metric_values[key] = value
             ttk.Label(proof, textvariable=value, style="Proof.TLabel").grid(
                 row=row,
@@ -413,7 +415,12 @@ class AitoClipOperatorApp:
             text="Cached artifacts only\nNo network uploads",
             style="Body.TLabel",
             justify="left",
-        ).grid(row=len(proof_rows) + 1, column=0, sticky="sw", pady=(24, 0))
+        ).grid(
+            row=len(INITIAL_PROOF_ROWS) + 1,
+            column=0,
+            sticky="sw",
+            pady=(24, 0),
+        )
 
     def start_processing(self) -> None:
         """Keep the unsafe full-pipeline action explicitly disconnected."""

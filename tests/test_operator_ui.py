@@ -7,7 +7,9 @@ import pytest
 import operator_ui
 from operator_ui import (
     DEMO_STAGES,
+    INITIAL_PROOF_ROWS,
     REPOSITORY_ROOT,
+    START_BUTTON_LABEL,
     START_PROCESSING_MESSAGE,
     DemoDataError,
     load_validation06,
@@ -50,6 +52,17 @@ def test_demo_sequence_and_disconnected_processing_contract() -> None:
         "YouTube uploader validated",
         "Facebook uploader validated",
     )
+    assert INITIAL_PROOF_ROWS == (
+        ("observations", "18,939 observations"),
+        ("generated", "176 generated"),
+        ("passing", "174 passing"),
+        ("selected", "174 selected"),
+        ("rendered", "174 rendered"),
+        ("before_eof", "172 rendered before EOF"),
+        ("youtube", "✓ YouTube upload validated"),
+        ("facebook", "✓ Facebook upload validated"),
+    )
+    assert START_BUTTON_LABEL == "Prototype 1 Pipeline · Disabled for Demo"
     assert "not connected" in START_PROCESSING_MESSAGE.lower()
 
     source = Path(operator_ui.__file__).read_text(encoding="utf-8")
@@ -64,6 +77,30 @@ def test_demo_sequence_and_disconnected_processing_contract() -> None:
     assert imported_roots.isdisjoint(
         {"http", "pipeline", "requests", "uploading", "urllib"}
     )
+    assert "state=\"disabled\"" in source
+
+
+def test_output_folder_dispatches_without_opening_real_window(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    opened = []
+    if operator_ui.os.name == "nt":
+        monkeypatch.setattr(
+            operator_ui.os,
+            "startfile",
+            lambda path: opened.append(path),
+        )
+    else:
+        monkeypatch.setattr(
+            operator_ui.subprocess,
+            "Popen",
+            lambda command: opened.append(command),
+        )
+
+    operator_ui.open_output_folder(tmp_path)
+
+    assert str(tmp_path.resolve()) in str(opened[0])
 
 
 def test_demo_rejects_missing_validation_artifacts(tmp_path: Path) -> None:
