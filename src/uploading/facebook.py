@@ -17,6 +17,7 @@ FACEBOOK_DESTINATION = "facebook"
 FACEBOOK_VIDEO_URL = "https://www.facebook.com/{page_id}/videos/{video_id}/"
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _RETRYABLE_GRAPH_CODES = frozenset({1, 2, 4, 17, 32, 613})
+_RECOVERY_PAGE_SIZE = 25
 _PUBLISHING_STATES = {
     "public": ("published", True),
     "published": ("published", True),
@@ -180,7 +181,7 @@ class FacebookGraphClient:
         params: dict[str, object] | None = {
             "access_token": self._token,
             "fields": "id,description,permalink_url,published",
-            "limit": 100,
+            "limit": _RECOVERY_PAGE_SIZE,
         }
         while url is not None:
             response = self._request("get", url, params=params, timeout=(10, 60))

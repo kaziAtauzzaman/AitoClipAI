@@ -304,7 +304,18 @@ def test_facebook_graph_recovery_follows_page_pagination(tmp_path: Path) -> None
     next_url = "https://graph.facebook.com/v25.0/next-page?after=cursor"
     session = FakeSession(
         get_responses=[
-            FakeResponse(200, {"data": [], "paging": {"next": next_url}}),
+            FakeResponse(
+                200,
+                {
+                    "data": [
+                        {
+                            "id": "other-video",
+                            "description": "Another deterministic upload marker",
+                        }
+                    ],
+                    "paging": {"next": next_url},
+                },
+            ),
             FakeResponse(
                 200,
                 {
@@ -333,8 +344,26 @@ def test_facebook_graph_recovery_follows_page_pagination(tmp_path: Path) -> None
     assert session.get_calls[0]["params"]["fields"] == (
         "id,description,permalink_url,published"
     )
+    assert session.get_calls[0]["params"]["limit"] == 25
     assert session.get_calls[1]["url"] == next_url
     assert session.get_calls[1]["params"] is None
+
+
+def test_facebook_graph_recovery_size_error_stays_retryable(tmp_path: Path) -> None:
+    message = "Please reduce the amount of data you're asking for, then retry your request"
+    session = FakeSession(
+        get_responses=[
+            FakeResponse(400, {"error": {"code": 1, "message": message}})
+        ]
+    )
+    client = FacebookGraphClient(session, graph_config(tmp_path))
+
+    with pytest.raises(FacebookClientError, match="Please reduce") as captured:
+        client.find_video_by_upload_marker("aitoclip-upload-marker")
+
+    assert captured.value.retryable is True
+    assert len(session.get_calls) == 1
+    assert session.get_calls[0]["params"]["limit"] == 25
 
 
 @pytest.mark.parametrize(
