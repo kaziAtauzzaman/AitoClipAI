@@ -1,4 +1,4 @@
-"""Minimal read-only Build Week operator interface for AitoClipAI."""
+"""Tkinter operator interface for AitoClipAI."""
 
 from __future__ import annotations
 
@@ -7,11 +7,22 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 from typing import Sequence
+
+from operator_pipeline import (
+    OperatorPipelineController,
+    PipelineRunFailure,
+    PipelineRunSuccess,
+    PipelineStage,
+    RunInProgressError,
+    SourceValidationError,
+    validate_source,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -32,11 +43,8 @@ DEMO_STAGES = (
     "YouTube uploader validated",
     "Facebook uploader validated",
 )
-START_PROCESSING_MESSAGE = (
-    "Start Processing is not connected in the Build Week interface. "
-    "Use Demo Mode to inspect the completed Validation 06 run."
-)
-START_BUTTON_LABEL = "Prototype 1 Pipeline · Disabled for Demo"
+START_BUTTON_LABEL = "Start Processing"
+UPLOAD_DISABLED_LABEL = "Upload after processing — not enabled in this milestone."
 INITIAL_PROOF_ROWS = (
     ("observations", "18,939 observations"),
     ("generated", "176 generated"),
@@ -165,7 +173,7 @@ def _required_count(values: dict[str, object], key: str) -> int:
 
 
 class AitoClipOperatorApp:
-    """Dark Tkinter shell around the read-only Validation 06 demo."""
+    """Dark Tkinter interface for production processing and cached proof."""
 
     _BACKGROUND = "#0d0f10"
     _PANEL = "#171a1d"
@@ -176,16 +184,24 @@ class AitoClipOperatorApp:
     _RED = "#f16f6f"
     _BORDER = "#2a3035"
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        controller: OperatorPipelineController | None = None,
+    ) -> None:
         self.root = root
         self.root.title("AitoClipAI — Operator")
         self.root.geometry("1080x720")
         self.root.minsize(900, 620)
         self.root.configure(background=self._BACKGROUND)
 
+        self._controller = controller or OperatorPipelineController()
+        self._pipeline_events: queue.SimpleQueue[tuple[str, object]] = (
+            queue.SimpleQueue()
+        )
         self.source = tk.StringVar()
-        self.youtube_enabled = tk.BooleanVar(value=True)
-        self.facebook_enabled = tk.BooleanVar(value=True)
+        self.youtube_enabled = tk.BooleanVar(value=False)
+        self.facebook_enabled = tk.BooleanVar(value=False)
         self.current_stage = tk.StringVar(value="Ready")
         self.progress = tk.DoubleVar(value=0.0)
         self._metric_values: dict[str, tk.StringVar] = {}
@@ -195,6 +211,7 @@ class AitoClipOperatorApp:
 
         self._configure_style()
         self._build_layout()
+        self.root.after(75, self._drain_pipeline_events)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -300,7 +317,7 @@ class AitoClipOperatorApp:
         )
         ttk.Label(
             workspace,
-            text="YouTube / Twitch URL or local media path",
+            text="YouTube URL or supported local media path",
             style="Body.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(3, 7))
         source_entry = tk.Entry(
@@ -327,36 +344,45 @@ class AitoClipOperatorApp:
             text="YouTube",
             variable=self.youtube_enabled,
             style="Dark.TCheckbutton",
+            state="disabled",
         ).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(
             destinations,
             text="Facebook",
             variable=self.facebook_enabled,
             style="Dark.TCheckbutton",
+            state="disabled",
+        ).pack(side="left", padx=(0, 18))
+        ttk.Label(
+            destinations,
+            text=UPLOAD_DISABLED_LABEL,
+            style="Body.TLabel",
         ).pack(side="left")
 
         controls = ttk.Frame(workspace, style="Panel.TFrame")
         controls.grid(row=4, column=0, sticky="ew", pady=(0, 18))
-        ttk.Button(
+        self.start_button = ttk.Button(
             controls,
             text=START_BUTTON_LABEL,
             command=self.start_processing,
-            state="disabled",
-            style="Secondary.TButton",
-        ).pack(side="left", padx=(0, 8))
+            style="Primary.TButton",
+        )
+        self.start_button.pack(side="left", padx=(0, 8))
         self.demo_button = ttk.Button(
             controls,
             text="Demo Mode",
             command=self.run_demo,
-            style="Primary.TButton",
+            style="Secondary.TButton",
         )
         self.demo_button.pack(side="left", padx=(0, 8))
-        ttk.Button(
+        self.open_button = ttk.Button(
             controls,
             text="Open Output Folder",
             command=self.open_output,
+            state="disabled",
             style="Secondary.TButton",
-        ).pack(side="left")
+        )
+        self.open_button.pack(side="left")
 
         status_row = ttk.Frame(workspace, style="Panel.TFrame")
         status_row.grid(row=5, column=0, sticky="ew", pady=(0, 7))
@@ -393,7 +419,10 @@ class AitoClipOperatorApp:
         self.log.tag_configure("success", foreground=self._GREEN)
         self.log.tag_configure("error", foreground=self._RED)
         self.log.tag_configure("muted", foreground=self._MUTED)
-        self._append_log("Operator interface ready. Demo Mode is local-only.", "muted")
+        self._append_log(
+            "Operator interface ready. Uploads are disabled; Demo Mode is local-only.",
+            "muted",
+        )
 
         proof = ttk.Frame(body, style="Panel.TFrame", padding=18)
         proof.grid(row=0, column=1, sticky="nsew")
@@ -423,18 +452,114 @@ class AitoClipOperatorApp:
         )
 
     def start_processing(self) -> None:
-        """Keep the unsafe full-pipeline action explicitly disconnected."""
+        """Validate input and dispatch one real pipeline run off the UI thread."""
 
-        self.current_stage.set("Not connected")
+        if self._controller.is_running:
+            self._append_log("A pipeline run is already active.", "error")
+            return
+        try:
+            source = validate_source(self.source.get())
+        except SourceValidationError as exc:
+            self.current_stage.set(PipelineStage.FAILED.value)
+            self.progress.set(0)
+            self._append_log(str(exc), "error")
+            return
+
+        self._clear_log()
+        self.current_stage.set(PipelineStage.RESOLVING_SOURCE.value)
         self.progress.set(0)
-        self._append_log(START_PROCESSING_MESSAGE, "error")
+        self._output_directory = None
+        self.open_button.state(["disabled"])
+        self.start_button.state(["disabled"])
+        self.demo_button.state(["disabled"])
+        self._append_log("Pipeline run accepted. Uploads remain disabled.", "muted")
+        try:
+            self._controller.start(
+                source,
+                on_stage=lambda stage: self._pipeline_events.put(("stage", stage)),
+                on_success=lambda result: self._pipeline_events.put(
+                    ("success", result)
+                ),
+                on_failure=lambda failure: self._pipeline_events.put(
+                    ("failure", failure)
+                ),
+            )
+        except (RunInProgressError, SourceValidationError) as exc:
+            self._restore_idle_controls()
+            self.current_stage.set(PipelineStage.FAILED.value)
+            self._append_log(str(exc), "error")
+        except Exception as exc:
+            self._restore_idle_controls()
+            self.current_stage.set(PipelineStage.FAILED.value)
+            self._append_log(
+                f"Could not start pipeline worker: {type(exc).__name__}.",
+                "error",
+            )
+
+    def _drain_pipeline_events(self) -> None:
+        """Apply worker callbacks on Tk's owning thread."""
+
+        while True:
+            try:
+                event, payload = self._pipeline_events.get_nowait()
+            except queue.Empty:
+                break
+            if event == "stage" and isinstance(payload, PipelineStage):
+                self._show_pipeline_stage(payload)
+            elif event == "success" and isinstance(payload, PipelineRunSuccess):
+                self._show_pipeline_success(payload)
+            elif event == "failure" and isinstance(payload, PipelineRunFailure):
+                self._show_pipeline_failure(payload)
+        self.root.after(75, self._drain_pipeline_events)
+
+    def _show_pipeline_stage(self, stage: PipelineStage) -> None:
+        self.current_stage.set(stage.value)
+        if stage is PipelineStage.COMPLETED:
+            self.progress.set(100)
+            return
+        if stage is PipelineStage.FAILED:
+            self.progress.set(0)
+            return
+        self._append_log(stage.value, "success")
+
+    def _show_pipeline_success(self, result: PipelineRunSuccess) -> None:
+        self._output_directory = result.output_directory
+        self.current_stage.set(PipelineStage.COMPLETED.value)
+        self.progress.set(100)
+        self._append_log(
+            f"Completed with {result.rendered_clip_count} rendered clips.",
+            "success",
+        )
+        self._append_log(f"Output directory: {result.output_directory}", "muted")
+        self._append_log("No network upload was performed.", "muted")
+        self.open_button.state(["!disabled"])
+        self._restore_idle_controls()
+
+    def _show_pipeline_failure(self, failure: PipelineRunFailure) -> None:
+        self.current_stage.set(PipelineStage.FAILED.value)
+        self.progress.set(0)
+        self._append_log(failure.message, "error")
+        if failure.log_path is not None:
+            self._append_log(f"Detailed log: {failure.log_path}", "muted")
+        if failure.run_directory is not None and failure.run_directory.is_dir():
+            self._output_directory = failure.run_directory
+            self.open_button.state(["!disabled"])
+        self._restore_idle_controls()
+
+    def _restore_idle_controls(self) -> None:
+        self.start_button.state(["!disabled"])
+        self.demo_button.state(["!disabled"])
 
     def run_demo(self) -> None:
         """Load cached proof and present a short local-only stage sequence."""
 
+        if self._controller.is_running:
+            self._append_log("Demo Mode is unavailable during a pipeline run.", "error")
+            return
         self._demo_run += 1
         run = self._demo_run
         self.last_demo_error = None
+        self.start_button.state(["disabled"])
         self.demo_button.state(["disabled"])
         self.current_stage.set("Loading cached Validation 06 proof")
         self.progress.set(0)
@@ -449,10 +574,11 @@ class AitoClipOperatorApp:
             self.last_demo_error = str(exc)
             self.current_stage.set("Demo unavailable")
             self._append_log(str(exc), "error")
-            self.demo_button.state(["!disabled"])
+            self._restore_idle_controls()
             return
 
         self._output_directory = proof.clips_directory
+        self.open_button.state(["!disabled"])
         self.source.set(proof.source)
         self._show_proof(proof)
         self._emit_demo_stage(run, 0)
@@ -473,7 +599,7 @@ class AitoClipOperatorApp:
             "muted",
         )
         self._append_log("No network upload was performed.", "muted")
-        self.demo_button.state(["!disabled"])
+        self._restore_idle_controls()
 
     def _show_proof(self, proof: Validation06Proof) -> None:
         values = {
@@ -492,7 +618,7 @@ class AitoClipOperatorApp:
             self._metric_values[key].set(value)
 
     def open_output(self) -> None:
-        """Open cached clips without reading or executing any media."""
+        """Open the current run output or cached Demo Mode clips."""
 
         folder = self._output_directory
         if folder is None:

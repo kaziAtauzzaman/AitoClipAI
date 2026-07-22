@@ -1,16 +1,19 @@
 import ast
 from pathlib import Path
 import socket
+import subprocess
+import sys
 
 import pytest
 
 import operator_ui
+from operator_pipeline import PipelineRunFailure, PipelineRunSuccess
 from operator_ui import (
     DEMO_STAGES,
     INITIAL_PROOF_ROWS,
     REPOSITORY_ROOT,
     START_BUTTON_LABEL,
-    START_PROCESSING_MESSAGE,
+    UPLOAD_DISABLED_LABEL,
     DemoDataError,
     load_validation06,
 )
@@ -42,7 +45,7 @@ def test_demo_loads_validation06_without_network_or_writes(monkeypatch) -> None:
     assert (summary.stat().st_size, summary.stat().st_mtime_ns) == before
 
 
-def test_demo_sequence_and_disconnected_processing_contract() -> None:
+def test_demo_sequence_and_operator_integration_contract() -> None:
     assert DEMO_STAGES == (
         "Source resolved",
         "Observations loaded",
@@ -62,8 +65,10 @@ def test_demo_sequence_and_disconnected_processing_contract() -> None:
         ("youtube", "✓ YouTube upload validated"),
         ("facebook", "✓ Facebook upload validated"),
     )
-    assert START_BUTTON_LABEL == "Prototype 1 Pipeline · Disabled for Demo"
-    assert "not connected" in START_PROCESSING_MESSAGE.lower()
+    assert START_BUTTON_LABEL == "Start Processing"
+    assert UPLOAD_DISABLED_LABEL == (
+        "Upload after processing — not enabled in this milestone."
+    )
 
     source = Path(operator_ui.__file__).read_text(encoding="utf-8")
     imported_roots = set()
@@ -77,7 +82,101 @@ def test_demo_sequence_and_disconnected_processing_contract() -> None:
     assert imported_roots.isdisjoint(
         {"http", "pipeline", "requests", "uploading", "urllib"}
     )
+    assert "operator_pipeline" in imported_roots
     assert "state=\"disabled\"" in source
+
+
+def test_ui_import_does_not_load_pipeline() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import operator_ui; "
+                "assert 'pipeline' not in sys.modules"
+            ),
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**operator_ui.os.environ, "PYTHONPATH": str(REPOSITORY_ROOT / "src")},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+class _FakeVariable:
+    def __init__(self) -> None:
+        self.value = None
+
+    def set(self, value) -> None:
+        self.value = value
+
+
+class _FakeButton:
+    def __init__(self) -> None:
+        self.states: list[tuple[str, ...]] = []
+
+    def state(self, values) -> None:
+        self.states.append(tuple(values))
+
+
+def _terminal_state_app():
+    app = operator_ui.AitoClipOperatorApp.__new__(
+        operator_ui.AitoClipOperatorApp
+    )
+    app.current_stage = _FakeVariable()
+    app.progress = _FakeVariable()
+    app.open_button = _FakeButton()
+    app.start_button = _FakeButton()
+    app.demo_button = _FakeButton()
+    app._output_directory = None
+    messages = []
+    app._append_log = lambda message, tag: messages.append((message, tag))
+    return app, messages
+
+
+def test_successful_pipeline_completion_updates_ui_state(tmp_path: Path) -> None:
+    app, messages = _terminal_state_app()
+    output = tmp_path / "clips"
+    result = PipelineRunSuccess(
+        run_directory=tmp_path,
+        log_path=tmp_path / "run.log",
+        output_directory=output,
+        rendered_clip_count=7,
+    )
+
+    app._show_pipeline_success(result)
+
+    assert app.current_stage.value == "Completed"
+    assert app.progress.value == 100
+    assert app._output_directory == output
+    assert app.open_button.states[-1] == ("!disabled",)
+    assert app.start_button.states[-1] == ("!disabled",)
+    assert app.demo_button.states[-1] == ("!disabled",)
+    assert ("Completed with 7 rendered clips.", "success") in messages
+    assert ("No network upload was performed.", "muted") in messages
+
+
+def test_failed_pipeline_completion_updates_ui_state(tmp_path: Path) -> None:
+    app, messages = _terminal_state_app()
+    failure = PipelineRunFailure(
+        message="RuntimeError: observer failed",
+        run_directory=tmp_path,
+        log_path=tmp_path / "run.log",
+    )
+
+    app._show_pipeline_failure(failure)
+
+    assert app.current_stage.value == "Failed"
+    assert app.progress.value == 0
+    assert app._output_directory == tmp_path
+    assert app.open_button.states[-1] == ("!disabled",)
+    assert app.start_button.states[-1] == ("!disabled",)
+    assert app.demo_button.states[-1] == ("!disabled",)
+    assert ("RuntimeError: observer failed", "error") in messages
+    assert (f"Detailed log: {tmp_path / 'run.log'}", "muted") in messages
 
 
 def test_output_folder_dispatches_without_opening_real_window(
