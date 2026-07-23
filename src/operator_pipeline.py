@@ -72,6 +72,17 @@ class PipelineExecution:
     output_directory: Path
     rendered_clip_count: int
     report_path: Path | None = None
+    rendered_clips: tuple[RenderedClipOutput, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedClipOutput:
+    """Immutable rendered output ready for optional upload orchestration."""
+
+    path: Path
+    identity: str
+    title: str
+    description: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +94,7 @@ class PipelineRunSuccess:
     output_directory: Path
     rendered_clip_count: int
     report_path: Path | None = None
+    rendered_clips: tuple[RenderedClipOutput, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,10 +264,12 @@ class ProductionPipelineRunner:
         ).write(report)
         if report.status != "completed":
             raise RuntimeError(_production_failure_message(report))
+        rendered_clips = _rendered_clip_outputs(report)
         return PipelineExecution(
             output_directory=clips_directory,
-            rendered_clip_count=len(report.render_jobs),
+            rendered_clip_count=len(rendered_clips),
             report_path=report_path,
+            rendered_clips=rendered_clips,
         )
 
 
@@ -371,6 +385,43 @@ def _production_failure_message(report: Any) -> str:
     return f"Production pipeline ended with status {report.status}."
 
 
+def _rendered_clip_outputs(report: Any) -> tuple[RenderedClipOutput, ...]:
+    session_id = getattr(report, "session_id", None)
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise RuntimeError("Production report has no render session identity.")
+    outputs: list[RenderedClipOutput] = []
+    identities: set[int] = set()
+    for job in report.render_jobs:
+        render_identity = job.metadata.get("incremental_render_identity")
+        if (
+            isinstance(render_identity, bool)
+            or not isinstance(render_identity, int)
+            or render_identity <= 0
+            or render_identity in identities
+        ):
+            raise RuntimeError(
+                "Production report has a missing or duplicate render identity."
+            )
+        identities.add(render_identity)
+        candidate_title = job.candidate.title
+        title = (
+            candidate_title.strip()
+            if isinstance(candidate_title, str) and candidate_title.strip()
+            else f"{job.candidate.source_video_path.stem} — clip {render_identity}"
+        )
+        outputs.append(
+            RenderedClipOutput(
+                path=Path(job.output_path),
+                identity=(
+                    f"render:{session_id.strip()}:identity-{render_identity}"
+                ),
+                title=title[:100].rstrip(),
+                description=job.candidate.reason,
+            )
+        )
+    return tuple(outputs)
+
+
 class OperatorPipelineController:
     """Own one background pipeline run and its UI-safe result callbacks."""
 
@@ -453,6 +504,7 @@ class OperatorPipelineController:
                     output_directory=execution.output_directory,
                     rendered_clip_count=execution.rendered_clip_count,
                     report_path=execution.report_path,
+                    rendered_clips=execution.rendered_clips,
                 )
             )
         except BaseException as exc:

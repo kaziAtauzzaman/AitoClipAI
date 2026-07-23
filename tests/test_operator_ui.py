@@ -7,13 +7,24 @@ import sys
 import pytest
 
 import operator_ui
-from operator_pipeline import PipelineRunFailure, PipelineRunSuccess
+from operator_pipeline import (
+    PipelineRunFailure,
+    PipelineRunSuccess,
+    RenderedClipOutput,
+)
+from operator_upload import (
+    YOUTUBE_DESTINATION,
+    UploadAttempt,
+    UploadEventKind,
+    UploadQueueEvent,
+    UploadQueueSummary,
+)
 from operator_ui import (
     DEMO_STAGES,
     INITIAL_PROOF_ROWS,
     REPOSITORY_ROOT,
     START_BUTTON_LABEL,
-    UPLOAD_DISABLED_LABEL,
+    UPLOAD_OPTION_LABEL,
     DemoDataError,
     load_validation06,
 )
@@ -66,8 +77,8 @@ def test_demo_sequence_and_operator_integration_contract() -> None:
         ("facebook", "✓ Facebook upload validated"),
     )
     assert START_BUTTON_LABEL == "Start Processing"
-    assert UPLOAD_DISABLED_LABEL == (
-        "Upload after processing — not enabled in this milestone."
+    assert UPLOAD_OPTION_LABEL == (
+        "Upload after processing — optional and off by default."
     )
 
     source = Path(operator_ui.__file__).read_text(encoding="utf-8")
@@ -83,6 +94,9 @@ def test_demo_sequence_and_operator_integration_contract() -> None:
         {"http", "pipeline", "requests", "uploading", "urllib"}
     )
     assert "operator_pipeline" in imported_roots
+    assert "operator_upload" in imported_roots
+    assert "self.youtube_enabled = tk.BooleanVar(value=False)" in source
+    assert "self.facebook_enabled = tk.BooleanVar(value=False)" in source
     assert "state=\"disabled\"" in source
 
 
@@ -93,7 +107,8 @@ def test_ui_import_does_not_load_pipeline() -> None:
             "-c",
             (
                 "import sys; import operator_ui; "
-                "assert 'pipeline' not in sys.modules"
+                "assert 'pipeline' not in sys.modules; "
+                "assert 'uploading' not in sys.modules"
             ),
         ],
         cwd=REPOSITORY_ROOT,
@@ -122,6 +137,15 @@ class _FakeButton:
         self.states.append(tuple(values))
 
 
+class _FakeUploadController:
+    def __init__(self) -> None:
+        self.is_running = False
+        self.starts = []
+
+    def start(self, clips, destinations, **callbacks):
+        self.starts.append((tuple(clips), tuple(destinations), callbacks))
+
+
 def _terminal_state_app():
     app = operator_ui.AitoClipOperatorApp.__new__(
         operator_ui.AitoClipOperatorApp
@@ -131,10 +155,31 @@ def _terminal_state_app():
     app.open_button = _FakeButton()
     app.start_button = _FakeButton()
     app.demo_button = _FakeButton()
+    app.youtube_checkbox = _FakeButton()
+    app.facebook_checkbox = _FakeButton()
+    app._upload_controller = _FakeUploadController()
+    app._requested_destinations = ()
+    app._pipeline_events = operator_ui.queue.SimpleQueue()
     app._output_directory = None
     messages = []
     app._append_log = lambda message, tag: messages.append((message, tag))
     return app, messages
+
+
+def test_workflow_disables_and_reenables_upload_checkboxes() -> None:
+    app, _ = _terminal_state_app()
+
+    app._set_workflow_controls(active=True)
+    app._set_workflow_controls(active=False)
+
+    assert app.youtube_checkbox.states == [
+        ("disabled",),
+        ("!disabled",),
+    ]
+    assert app.facebook_checkbox.states == [
+        ("disabled",),
+        ("!disabled",),
+    ]
 
 
 def test_successful_pipeline_completion_updates_ui_state(tmp_path: Path) -> None:
@@ -155,8 +200,92 @@ def test_successful_pipeline_completion_updates_ui_state(tmp_path: Path) -> None
     assert app.open_button.states[-1] == ("!disabled",)
     assert app.start_button.states[-1] == ("!disabled",)
     assert app.demo_button.states[-1] == ("!disabled",)
+    assert app.youtube_checkbox.states[-1] == ("!disabled",)
+    assert app.facebook_checkbox.states[-1] == ("!disabled",)
     assert ("Completed with 7 rendered clips.", "success") in messages
-    assert ("No network upload was performed.", "muted") in messages
+    assert ("No upload was requested.", "muted") in messages
+    assert app._upload_controller.starts == []
+
+
+def test_checked_destination_queues_rendered_outputs_after_success(
+    tmp_path: Path,
+) -> None:
+    app, messages = _terminal_state_app()
+    app._requested_destinations = (YOUTUBE_DESTINATION,)
+    clip = RenderedClipOutput(
+        path=tmp_path / "clips" / "one.mp4",
+        identity="render:session:identity-1",
+        title="Clip 1",
+        description="Description 1",
+    )
+    result = PipelineRunSuccess(
+        run_directory=tmp_path,
+        log_path=tmp_path / "run.log",
+        output_directory=tmp_path / "clips",
+        rendered_clip_count=1,
+        rendered_clips=(clip,),
+    )
+
+    app._show_pipeline_success(result)
+
+    assert app.current_stage.value == "Uploading"
+    assert app.progress.value == 0
+    assert len(app._upload_controller.starts) == 1
+    clips, destinations, callbacks = app._upload_controller.starts[0]
+    assert clips == (clip,)
+    assert destinations == (YOUTUBE_DESTINATION,)
+    assert app.start_button.states == []
+    assert ("Queued 1 rendered clips for upload.", "muted") in messages
+
+    callbacks["on_event"](
+        UploadQueueEvent(
+            UploadEventKind.STARTED,
+            YOUTUBE_DESTINATION,
+            1,
+            1,
+        )
+    )
+    callbacks["on_complete"](
+        UploadQueueSummary(
+            (
+                UploadAttempt(
+                    YOUTUBE_DESTINATION,
+                    clip.identity,
+                    True,
+                ),
+            )
+        )
+    )
+
+    event_name, event = app._pipeline_events.get_nowait()
+    summary_name, summary = app._pipeline_events.get_nowait()
+    assert event_name == "upload_event"
+    assert event.message == "Uploading clip 1 of 1 to YouTube..."
+    assert summary_name == "upload_summary"
+    assert summary.completed == 1
+
+
+def test_upload_summary_restores_controls_and_reports_partial_failure() -> None:
+    app, messages = _terminal_state_app()
+    summary = UploadQueueSummary(
+        (
+            UploadAttempt(YOUTUBE_DESTINATION, "render:1", True),
+            UploadAttempt(
+                YOUTUBE_DESTINATION,
+                "render:2",
+                False,
+                error_type="RetryableUploadError",
+            ),
+        )
+    )
+
+    app._show_upload_summary(summary)
+
+    assert app.current_stage.value == "Completed with upload failures"
+    assert app.progress.value == 100
+    assert ("Upload summary: 1 completed, 1 failed.", "error") in messages
+    assert app.start_button.states[-1] == ("!disabled",)
+    assert app.youtube_checkbox.states[-1] == ("!disabled",)
 
 
 def test_failed_pipeline_completion_updates_ui_state(tmp_path: Path) -> None:
@@ -175,6 +304,8 @@ def test_failed_pipeline_completion_updates_ui_state(tmp_path: Path) -> None:
     assert app.open_button.states[-1] == ("!disabled",)
     assert app.start_button.states[-1] == ("!disabled",)
     assert app.demo_button.states[-1] == ("!disabled",)
+    assert app.youtube_checkbox.states[-1] == ("!disabled",)
+    assert app.facebook_checkbox.states[-1] == ("!disabled",)
     assert ("RuntimeError: observer failed", "error") in messages
     assert (f"Detailed log: {tmp_path / 'run.log'}", "muted") in messages
 

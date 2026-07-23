@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from core import ClipCandidate, RenderJob
 from operator_pipeline import (
     OperatorPipelineController,
     PipelineExecution,
+    RenderedClipOutput,
     PipelineStage,
     RunInProgressError,
     SourceKind,
@@ -17,6 +19,7 @@ from operator_pipeline import (
     _IncrementalRendererWithStage,
     _OneShotStageReporter,
     _SelectorWithStage,
+    _rendered_clip_outputs,
     _stage_local_source,
     validate_source,
 )
@@ -40,10 +43,20 @@ class _SuccessfulRunner:
             emit_stage(stage)
         output = run_directory / "clips"
         output.mkdir()
+        rendered_clips = tuple(
+            RenderedClipOutput(
+                path=output / f"clip-{identity}.mp4",
+                identity=f"render:test:identity-{identity}",
+                title=f"Clip {identity}",
+                description=f"Rendered clip {identity}",
+            )
+            for identity in range(1, 4)
+        )
         return PipelineExecution(
             output_directory=output,
             rendered_clip_count=3,
             report_path=run_directory / "reports" / "validation-report.json",
+            rendered_clips=rendered_clips,
         )
 
 
@@ -167,6 +180,42 @@ def test_stage_adapters_preserve_incremental_production_contract(
     assert reported == []
 
 
+def test_production_render_jobs_become_stable_upload_outputs(
+    tmp_path: Path,
+) -> None:
+    candidate = ClipCandidate(
+        source_video_path=tmp_path / "source.mp4",
+        start_seconds=1.0,
+        end_seconds=9.0,
+        reason="Strong speech and audio peak.",
+    )
+    report = SimpleNamespace(
+        session_id="operator-session",
+        render_jobs=[
+            RenderJob(
+                candidate=candidate,
+                output_path=tmp_path / "clips" / "one.mp4",
+                metadata={"incremental_render_identity": 1},
+            ),
+            RenderJob(
+                candidate=candidate,
+                output_path=tmp_path / "clips" / "two.mp4",
+                metadata={"incremental_render_identity": 2},
+            ),
+        ],
+    )
+
+    outputs = _rendered_clip_outputs(report)
+
+    assert [item.path.name for item in outputs] == ["one.mp4", "two.mp4"]
+    assert [item.identity for item in outputs] == [
+        "render:operator-session:identity-1",
+        "render:operator-session:identity-2",
+    ]
+    assert outputs[0].title == "source — clip 1"
+    assert outputs[0].description == "Strong speech and audio peak."
+
+
 def test_controller_runs_fake_pipeline_once_in_background(
     monkeypatch,
     tmp_path: Path,
@@ -203,6 +252,7 @@ def test_controller_runs_fake_pipeline_once_in_background(
     assert successes[0].run_directory == run_directory.resolve()
     assert successes[0].output_directory == run_directory.resolve() / "clips"
     assert successes[0].rendered_clip_count == 3
+    assert len(successes[0].rendered_clips) == 3
     assert stages == [
         PipelineStage.RESOLVING_SOURCE,
         PipelineStage.READING_MEDIA,

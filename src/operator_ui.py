@@ -23,6 +23,14 @@ from operator_pipeline import (
     SourceValidationError,
     validate_source,
 )
+from operator_upload import (
+    FACEBOOK_DESTINATION,
+    YOUTUBE_DESTINATION,
+    OperatorUploadController,
+    UploadQueueBusyError,
+    UploadQueueEvent,
+    UploadQueueSummary,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +52,7 @@ DEMO_STAGES = (
     "Facebook uploader validated",
 )
 START_BUTTON_LABEL = "Start Processing"
-UPLOAD_DISABLED_LABEL = "Upload after processing — not enabled in this milestone."
+UPLOAD_OPTION_LABEL = "Upload after processing — optional and off by default."
 INITIAL_PROOF_ROWS = (
     ("observations", "18,939 observations"),
     ("generated", "176 generated"),
@@ -188,6 +196,7 @@ class AitoClipOperatorApp:
         self,
         root: tk.Tk,
         controller: OperatorPipelineController | None = None,
+        upload_controller: OperatorUploadController | None = None,
     ) -> None:
         self.root = root
         self.root.title("AitoClipAI — Operator")
@@ -196,6 +205,7 @@ class AitoClipOperatorApp:
         self.root.configure(background=self._BACKGROUND)
 
         self._controller = controller or OperatorPipelineController()
+        self._upload_controller = upload_controller or OperatorUploadController()
         self._pipeline_events: queue.SimpleQueue[tuple[str, object]] = (
             queue.SimpleQueue()
         )
@@ -206,6 +216,7 @@ class AitoClipOperatorApp:
         self.progress = tk.DoubleVar(value=0.0)
         self._metric_values: dict[str, tk.StringVar] = {}
         self._output_directory: Path | None = None
+        self._requested_destinations: tuple[str, ...] = ()
         self._demo_run = 0
         self.last_demo_error: str | None = None
 
@@ -339,23 +350,23 @@ class AitoClipOperatorApp:
         ttk.Label(destinations, text="DESTINATIONS", style="Section.TLabel").pack(
             side="left", padx=(0, 20)
         )
-        ttk.Checkbutton(
+        self.youtube_checkbox = ttk.Checkbutton(
             destinations,
             text="YouTube",
             variable=self.youtube_enabled,
             style="Dark.TCheckbutton",
-            state="disabled",
-        ).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(
+        )
+        self.youtube_checkbox.pack(side="left", padx=(0, 12))
+        self.facebook_checkbox = ttk.Checkbutton(
             destinations,
             text="Facebook",
             variable=self.facebook_enabled,
             style="Dark.TCheckbutton",
-            state="disabled",
-        ).pack(side="left", padx=(0, 18))
+        )
+        self.facebook_checkbox.pack(side="left", padx=(0, 18))
         ttk.Label(
             destinations,
-            text=UPLOAD_DISABLED_LABEL,
+            text=UPLOAD_OPTION_LABEL,
             style="Body.TLabel",
         ).pack(side="left")
 
@@ -420,7 +431,7 @@ class AitoClipOperatorApp:
         self.log.tag_configure("error", foreground=self._RED)
         self.log.tag_configure("muted", foreground=self._MUTED)
         self._append_log(
-            "Operator interface ready. Uploads are disabled; Demo Mode is local-only.",
+            "Operator interface ready. Uploads run only when selected.",
             "muted",
         )
 
@@ -454,8 +465,11 @@ class AitoClipOperatorApp:
     def start_processing(self) -> None:
         """Validate input and dispatch one real pipeline run off the UI thread."""
 
-        if self._controller.is_running:
-            self._append_log("A pipeline run is already active.", "error")
+        if self._workflow_is_running:
+            self._append_log(
+                "A processing or upload workflow is already active.",
+                "error",
+            )
             return
         try:
             source = validate_source(self.source.get())
@@ -469,10 +483,29 @@ class AitoClipOperatorApp:
         self.current_stage.set(PipelineStage.RESOLVING_SOURCE.value)
         self.progress.set(0)
         self._output_directory = None
+        self._requested_destinations = tuple(
+            destination
+            for destination, enabled in (
+                (YOUTUBE_DESTINATION, self.youtube_enabled.get()),
+                (FACEBOOK_DESTINATION, self.facebook_enabled.get()),
+            )
+            if enabled
+        )
         self.open_button.state(["disabled"])
-        self.start_button.state(["disabled"])
-        self.demo_button.state(["disabled"])
-        self._append_log("Pipeline run accepted. Uploads remain disabled.", "muted")
+        self._set_workflow_controls(active=True)
+        if self._requested_destinations:
+            labels = ", ".join(
+                destination.title() for destination in self._requested_destinations
+            )
+            self._append_log(
+                f"Pipeline run accepted. Post-render uploads selected: {labels}.",
+                "muted",
+            )
+        else:
+            self._append_log(
+                "Pipeline run accepted. No post-render uploads selected.",
+                "muted",
+            )
         try:
             self._controller.start(
                 source,
@@ -510,6 +543,14 @@ class AitoClipOperatorApp:
                 self._show_pipeline_success(payload)
             elif event == "failure" and isinstance(payload, PipelineRunFailure):
                 self._show_pipeline_failure(payload)
+            elif event == "upload_event" and isinstance(payload, UploadQueueEvent):
+                self._show_upload_event(payload)
+            elif event == "upload_summary" and isinstance(
+                payload, UploadQueueSummary
+            ):
+                self._show_upload_summary(payload)
+            elif event == "upload_failure" and isinstance(payload, str):
+                self._show_upload_failure(payload)
         self.root.after(75, self._drain_pipeline_events)
 
     def _show_pipeline_stage(self, stage: PipelineStage) -> None:
@@ -531,9 +572,44 @@ class AitoClipOperatorApp:
             "success",
         )
         self._append_log(f"Output directory: {result.output_directory}", "muted")
-        self._append_log("No network upload was performed.", "muted")
         self.open_button.state(["!disabled"])
-        self._restore_idle_controls()
+        if not self._requested_destinations:
+            self._append_log("No upload was requested.", "muted")
+            self._restore_idle_controls()
+            return
+        if not result.rendered_clips:
+            self.current_stage.set("Completed with upload failures")
+            self._append_log(
+                "Upload queue could not start because no rendered outputs "
+                "were returned.",
+                "error",
+            )
+            self._restore_idle_controls()
+            return
+        self.current_stage.set("Uploading")
+        self.progress.set(0)
+        self._append_log(
+            f"Queued {len(result.rendered_clips)} rendered clips for upload.",
+            "muted",
+        )
+        try:
+            self._upload_controller.start(
+                result.rendered_clips,
+                self._requested_destinations,
+                on_event=lambda event: self._pipeline_events.put(
+                    ("upload_event", event)
+                ),
+                on_complete=lambda summary: self._pipeline_events.put(
+                    ("upload_summary", summary)
+                ),
+                on_failure=lambda error_type: self._pipeline_events.put(
+                    ("upload_failure", error_type)
+                ),
+            )
+        except (UploadQueueBusyError, ValueError) as exc:
+            self._show_upload_failure(type(exc).__name__)
+        except Exception as exc:
+            self._show_upload_failure(type(exc).__name__)
 
     def _show_pipeline_failure(self, failure: PipelineRunFailure) -> None:
         self.current_stage.set(PipelineStage.FAILED.value)
@@ -547,20 +623,63 @@ class AitoClipOperatorApp:
         self._restore_idle_controls()
 
     def _restore_idle_controls(self) -> None:
-        self.start_button.state(["!disabled"])
-        self.demo_button.state(["!disabled"])
+        self._set_workflow_controls(active=False)
+
+    def _show_upload_event(self, event: UploadQueueEvent) -> None:
+        self.current_stage.set(f"Uploading to {event.platform_label}")
+        tag = "error" if event.kind.value == "failed" else "success"
+        self._append_log(event.message, tag)
+
+    def _show_upload_summary(self, summary: UploadQueueSummary) -> None:
+        self.progress.set(100)
+        if summary.failed:
+            self.current_stage.set("Completed with upload failures")
+            self._append_log(
+                f"Upload summary: {summary.completed} completed, "
+                f"{summary.failed} failed.",
+                "error",
+            )
+        else:
+            self.current_stage.set(PipelineStage.COMPLETED.value)
+            self._append_log(
+                f"Upload summary: {summary.completed} completed, 0 failed.",
+                "success",
+            )
+        self._restore_idle_controls()
+
+    def _show_upload_failure(self, error_type: str) -> None:
+        self.current_stage.set("Completed with upload failures")
+        self.progress.set(100)
+        self._append_log(
+            f"Upload queue stopped unexpectedly ({error_type}).",
+            "error",
+        )
+        self._restore_idle_controls()
+
+    @property
+    def _workflow_is_running(self) -> bool:
+        return self._controller.is_running or self._upload_controller.is_running
+
+    def _set_workflow_controls(self, *, active: bool) -> None:
+        state = ["disabled"] if active else ["!disabled"]
+        self.start_button.state(state)
+        self.demo_button.state(state)
+        self.youtube_checkbox.state(state)
+        self.facebook_checkbox.state(state)
 
     def run_demo(self) -> None:
         """Load cached proof and present a short local-only stage sequence."""
 
-        if self._controller.is_running:
-            self._append_log("Demo Mode is unavailable during a pipeline run.", "error")
+        if self._workflow_is_running:
+            self._append_log(
+                "Demo Mode is unavailable during processing or uploads.",
+                "error",
+            )
             return
         self._demo_run += 1
         run = self._demo_run
         self.last_demo_error = None
-        self.start_button.state(["disabled"])
-        self.demo_button.state(["disabled"])
+        self._set_workflow_controls(active=True)
         self.current_stage.set("Loading cached Validation 06 proof")
         self.progress.set(0)
         self._clear_log()
