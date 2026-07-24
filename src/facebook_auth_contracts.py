@@ -10,6 +10,7 @@ class FacebookCredentialState(str, Enum):
     """Operator-visible state for one configured Facebook Page credential."""
 
     CONNECTED = "connected"
+    CREDENTIAL_STORED = "credential_stored"
     NOT_CONFIGURED = "not_configured"
     REAUTHORIZATION_REQUIRED = "reauthorization_required"
     PERMISSION_ERROR = "permission_error"
@@ -20,6 +21,7 @@ class FacebookCredentialState(str, Enum):
     def label(self) -> str:
         return {
             self.CONNECTED: "Facebook Connected",
+            self.CREDENTIAL_STORED: "Facebook Credential Stored",
             self.NOT_CONFIGURED: "Facebook Not Configured",
             self.REAUTHORIZATION_REQUIRED: (
                 "Facebook Reauthorization Required"

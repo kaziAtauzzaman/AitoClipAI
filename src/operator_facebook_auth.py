@@ -6,7 +6,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Protocol
+import threading
+from typing import Callable, Protocol
 
 from facebook_auth_contracts import (
     FacebookAuthenticationIssue,
@@ -27,8 +28,77 @@ class OperatorFacebookCredentialManager(Protocol):
     def current_state(self) -> FacebookCredentialState:
         """Inspect local configuration without making a network request."""
 
+    def validate(self) -> FacebookCredentialState:
+        """Validate the stored credential and configured Page."""
+
     def replace(self, token: str) -> FacebookCredentialState:
         """Validate and atomically replace one Page credential."""
+
+
+class FacebookCredentialPreflightBusyError(RuntimeError):
+    """Raised when a second Facebook credential preflight is requested."""
+
+
+PreflightSuccessCallback = Callable[[FacebookCredentialState], None]
+PreflightFailureCallback = Callable[[FacebookCredentialState], None]
+
+
+class OperatorFacebookPreflightController:
+    """Validate one stored credential without blocking Tk's event thread."""
+
+    def __init__(self, manager: OperatorFacebookCredentialManager) -> None:
+        self._manager = manager
+        self._lock = threading.Lock()
+        self._active_thread: threading.Thread | None = None
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._active_thread is not None
+
+    def start(
+        self,
+        *,
+        on_complete: PreflightSuccessCallback,
+        on_failure: PreflightFailureCallback,
+    ) -> threading.Thread:
+        with self._lock:
+            if self._active_thread is not None:
+                raise FacebookCredentialPreflightBusyError(
+                    "A Facebook credential preflight is already active."
+                )
+            thread = threading.Thread(
+                target=self._execute,
+                args=(on_complete, on_failure),
+                name="aitoclip-facebook-preflight",
+                daemon=False,
+            )
+            self._active_thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._active_thread = None
+                raise
+            return thread
+
+    def _execute(
+        self,
+        on_complete: PreflightSuccessCallback,
+        on_failure: PreflightFailureCallback,
+    ) -> None:
+        try:
+            state = self._manager.validate()
+        except FacebookAuthenticationIssue as exc:
+            state = exc.state
+        except BaseException:
+            state = FacebookCredentialState.UNAVAILABLE
+        with self._lock:
+            if self._active_thread is threading.current_thread():
+                self._active_thread = None
+        if state is FacebookCredentialState.CONNECTED:
+            on_complete(state)
+        else:
+            on_failure(state)
 
 
 class ProductionFacebookCredentialManager:
@@ -54,7 +124,7 @@ class ProductionFacebookCredentialManager:
             )
 
             return (
-                FacebookCredentialState.CONNECTED
+                FacebookCredentialState.CREDENTIAL_STORED
                 if WindowsFacebookCredentialStore().read(settings.page_id)
                 else FacebookCredentialState.NOT_CONFIGURED
             )
@@ -62,6 +132,27 @@ class ProductionFacebookCredentialManager:
             return exc.state
         except Exception:
             return FacebookCredentialState.UNAVAILABLE
+
+    def validate(self) -> FacebookCredentialState:
+        try:
+            settings = self._settings()
+            from uploading.facebook_credentials import (
+                create_facebook_credential_resolver,
+            )
+
+            create_facebook_credential_resolver(settings).resolve()
+        except FacebookAuthenticationIssue:
+            raise
+        except Exception as exc:
+            from uploading.errors import FacebookAuthenticationRequired
+
+            raise FacebookAuthenticationRequired(
+                FacebookCredentialState.UNAVAILABLE,
+                diagnostic=FacebookCredentialDiagnostic(
+                    stage="credential_preflight"
+                ),
+            ) from exc
+        return FacebookCredentialState.CONNECTED
 
     def replace(self, token: str) -> FacebookCredentialState:
         resolver = None

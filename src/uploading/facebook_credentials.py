@@ -117,7 +117,7 @@ class ValidatingFacebookCredentialResolver:
         except Exception as exc:
             raise _unavailable() from exc
         return (
-            FacebookCredentialState.CONNECTED
+            FacebookCredentialState.CREDENTIAL_STORED
             if token
             else FacebookCredentialState.NOT_CONFIGURED
         )

@@ -25,6 +25,9 @@ def test_operator_facebook_state_labels_are_stable() -> None:
         state: state.label for state in FacebookCredentialState
     } == {
         FacebookCredentialState.CONNECTED: "Facebook Connected",
+        FacebookCredentialState.CREDENTIAL_STORED: (
+            "Facebook Credential Stored"
+        ),
         FacebookCredentialState.NOT_CONFIGURED: "Facebook Not Configured",
         FacebookCredentialState.REAUTHORIZATION_REQUIRED: (
             "Facebook Reauthorization Required"
@@ -117,7 +120,10 @@ def test_first_time_configuration_validates_before_credential_write() -> None:
 
     assert validator.calls == [(TOKEN, PAGE_ID)]
     assert store.replacements == [(PAGE_ID, TOKEN)]
-    assert resolver.local_state() is FacebookCredentialState.CONNECTED
+    assert (
+        resolver.local_state()
+        is FacebookCredentialState.CREDENTIAL_STORED
+    )
     assert resolver.last_diagnostic == FacebookCredentialDiagnostic(
         stage="completed",
         validation_succeeded=True,
@@ -341,6 +347,101 @@ def test_credential_write_failure_reports_attempt_and_windows_error() -> None:
         cred_write_succeeded=False,
     )
     assert resolver.last_diagnostic == captured.value.diagnostic
+
+
+def test_production_manager_reports_stored_until_fresh_validation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "facebook.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "page_id": PAGE_ID,
+                "graph_api_version": "v25.0",
+                "ledger_path": "ledger.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    validations = []
+
+    class StoredCredential:
+        def read(self, page_id):
+            assert page_id == PAGE_ID
+            return TOKEN
+
+    class ValidResolver:
+        def resolve(self):
+            validations.append(PAGE_ID)
+            return TOKEN
+
+    import uploading.facebook_credentials as credentials
+
+    monkeypatch.setattr(
+        credentials,
+        "WindowsFacebookCredentialStore",
+        StoredCredential,
+    )
+    monkeypatch.setattr(
+        credentials,
+        "create_facebook_credential_resolver",
+        lambda settings: ValidResolver(),
+    )
+    manager = ProductionFacebookCredentialManager(config_path)
+
+    assert (
+        manager.current_state()
+        is FacebookCredentialState.CREDENTIAL_STORED
+    )
+    assert manager.validate() is FacebookCredentialState.CONNECTED
+    assert validations == [PAGE_ID]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        FacebookCredentialState.REAUTHORIZATION_REQUIRED,
+        FacebookCredentialState.NOT_CONFIGURED,
+        FacebookCredentialState.WRONG_PAGE,
+        FacebookCredentialState.PERMISSION_ERROR,
+        FacebookCredentialState.UNAVAILABLE,
+    ],
+)
+def test_production_manager_preflight_preserves_authentication_state(
+    monkeypatch,
+    tmp_path: Path,
+    state: FacebookCredentialState,
+) -> None:
+    config_path = tmp_path / "facebook.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "page_id": PAGE_ID,
+                "graph_api_version": "v25.0",
+                "ledger_path": "ledger.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FailingResolver:
+        def resolve(self):
+            raise FacebookAuthenticationRequired(state)
+
+    import uploading.facebook_credentials as credentials
+
+    monkeypatch.setattr(
+        credentials,
+        "create_facebook_credential_resolver",
+        lambda settings: FailingResolver(),
+    )
+    manager = ProductionFacebookCredentialManager(config_path)
+
+    with pytest.raises(FacebookAuthenticationRequired) as captured:
+        manager.validate()
+
+    assert captured.value.state is state
 
 
 def test_production_manager_writes_only_sanitized_diagnostic(

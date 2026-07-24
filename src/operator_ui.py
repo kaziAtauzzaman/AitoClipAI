@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from tkinter import scrolledtext, simpledialog, ttk
 from typing import Sequence
@@ -19,8 +20,19 @@ from facebook_auth_contracts import (
     FacebookCredentialState,
 )
 from operator_facebook_auth import (
+    FacebookCredentialPreflightBusyError,
     OperatorFacebookCredentialManager,
+    OperatorFacebookPreflightController,
     ProductionFacebookCredentialManager,
+)
+from operator_cleanup import (
+    CLEANUP_POLICY_OPTIONS,
+    CleanupPolicy,
+    CleanupRequest,
+    CleanupResult,
+    CleanupStatus,
+    OperatorCleanupController,
+    cleanup_policy_from_label,
 )
 from operator_pipeline import (
     OperatorPipelineController,
@@ -29,6 +41,7 @@ from operator_pipeline import (
     PipelineStage,
     RunInProgressError,
     SourceValidationError,
+    ValidatedSource,
     validate_source,
 )
 from operator_upload import (
@@ -60,6 +73,7 @@ DEMO_STAGES = (
     "Facebook uploader validated",
 )
 START_BUTTON_LABEL = "Start Processing"
+FACEBOOK_PREFLIGHT_STAGE = "Validating Facebook"
 UPLOAD_OPTION_LABEL = "Upload after processing — optional and off by default."
 INITIAL_PROOF_ROWS = (
     ("observations", "18,939 observations"),
@@ -200,6 +214,35 @@ def _facebook_diagnostic_stage_label(stage: str) -> str:
     return stage.replace("_", " ")
 
 
+def _facebook_preflight_failure_message(
+    state: FacebookCredentialState,
+) -> str:
+    return {
+        FacebookCredentialState.CREDENTIAL_STORED: (
+            "Facebook credential could not be validated. "
+            "Replace it before processing."
+        ),
+        FacebookCredentialState.NOT_CONFIGURED: (
+            "Facebook is not configured. Configure Facebook before processing."
+        ),
+        FacebookCredentialState.REAUTHORIZATION_REQUIRED: (
+            "Facebook authorization expired or was revoked. "
+            "Replace the Facebook credential before processing."
+        ),
+        FacebookCredentialState.PERMISSION_ERROR: (
+            "Facebook credential lacks the required Page publishing permission."
+        ),
+        FacebookCredentialState.WRONG_PAGE: (
+            "Facebook credential belongs to a different Page."
+        ),
+        FacebookCredentialState.UNAVAILABLE: (
+            "Facebook credential validation is unavailable. "
+            "Try again before processing."
+        ),
+        FacebookCredentialState.CONNECTED: "Facebook credential validated.",
+    }[state]
+
+
 class AitoClipOperatorApp:
     """Dark Tkinter interface for production processing and cached proof."""
 
@@ -217,7 +260,11 @@ class AitoClipOperatorApp:
         root: tk.Tk,
         controller: OperatorPipelineController | None = None,
         upload_controller: OperatorUploadController | None = None,
+        cleanup_controller: OperatorCleanupController | None = None,
         facebook_credentials: OperatorFacebookCredentialManager | None = None,
+        facebook_preflight_controller: (
+            OperatorFacebookPreflightController | None
+        ) = None,
     ) -> None:
         self.root = root
         self.root.title("AitoClipAI — Operator")
@@ -227,8 +274,13 @@ class AitoClipOperatorApp:
 
         self._controller = controller or OperatorPipelineController()
         self._upload_controller = upload_controller or OperatorUploadController()
+        self._cleanup_controller = cleanup_controller or OperatorCleanupController()
         self._facebook_credentials = (
             facebook_credentials or ProductionFacebookCredentialManager()
+        )
+        self._facebook_preflight_controller = (
+            facebook_preflight_controller
+            or OperatorFacebookPreflightController(self._facebook_credentials)
         )
         self._pipeline_events: queue.SimpleQueue[tuple[str, object]] = (
             queue.SimpleQueue()
@@ -236,6 +288,9 @@ class AitoClipOperatorApp:
         self.source = tk.StringVar()
         self.youtube_enabled = tk.BooleanVar(value=False)
         self.facebook_enabled = tk.BooleanVar(value=False)
+        self.cleanup_policy = tk.StringVar(
+            value=CleanupPolicy.KEEP_RENDERED_CLIPS.label
+        )
         initial_facebook_state = self._facebook_credentials.current_state()
         self.facebook_credential_state = tk.StringVar(
             value=initial_facebook_state.label
@@ -248,6 +303,11 @@ class AitoClipOperatorApp:
         self._metric_values: dict[str, tk.StringVar] = {}
         self._output_directory: Path | None = None
         self._requested_destinations: tuple[str, ...] = ()
+        self._requested_cleanup_policy = CleanupPolicy.KEEP_RENDERED_CLIPS
+        self._completed_run: PipelineRunSuccess | None = None
+        self._upload_thread: threading.Thread | None = None
+        self._pending_source: ValidatedSource | None = None
+        self._workflow_terminal_stage = PipelineStage.COMPLETED.value
         self._demo_run = 0
         self.last_demo_error: str | None = None
 
@@ -352,7 +412,7 @@ class AitoClipOperatorApp:
         workspace = ttk.Frame(body, style="Panel.TFrame", padding=18)
         workspace.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         workspace.columnconfigure(0, weight=1)
-        workspace.rowconfigure(8, weight=1)
+        workspace.rowconfigure(9, weight=1)
 
         ttk.Label(workspace, text="SOURCE", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
@@ -416,8 +476,25 @@ class AitoClipOperatorApp:
         )
         self.facebook_credential_button.pack(side="right")
 
+        cleanup = ttk.Frame(workspace, style="Panel.TFrame")
+        cleanup.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        ttk.Label(
+            cleanup,
+            text="CLEANUP AFTER SUCCESSFUL UPLOADS",
+            style="Section.TLabel",
+        ).pack(side="left", padx=(0, 16))
+        self.cleanup_policy_control = ttk.Combobox(
+            cleanup,
+            textvariable=self.cleanup_policy,
+            values=CLEANUP_POLICY_OPTIONS,
+            state="readonly",
+            width=51,
+            font=("Consolas", 9),
+        )
+        self.cleanup_policy_control.pack(side="right")
+
         controls = ttk.Frame(workspace, style="Panel.TFrame")
-        controls.grid(row=5, column=0, sticky="ew", pady=(0, 18))
+        controls.grid(row=6, column=0, sticky="ew", pady=(0, 18))
         self.start_button = ttk.Button(
             controls,
             text=START_BUTTON_LABEL,
@@ -442,7 +519,7 @@ class AitoClipOperatorApp:
         self.open_button.pack(side="left")
 
         status_row = ttk.Frame(workspace, style="Panel.TFrame")
-        status_row.grid(row=6, column=0, sticky="ew", pady=(0, 7))
+        status_row.grid(row=7, column=0, sticky="ew", pady=(0, 7))
         ttk.Label(status_row, text="CURRENT STAGE", style="Section.TLabel").pack(
             side="left"
         )
@@ -456,7 +533,7 @@ class AitoClipOperatorApp:
             variable=self.progress,
             maximum=100,
             style="Demo.Horizontal.TProgressbar",
-        ).grid(row=7, column=0, sticky="ew", pady=(0, 10))
+        ).grid(row=8, column=0, sticky="ew", pady=(0, 10))
 
         self.log = scrolledtext.ScrolledText(
             workspace,
@@ -472,7 +549,7 @@ class AitoClipOperatorApp:
             pady=10,
             state="disabled",
         )
-        self.log.grid(row=8, column=0, sticky="nsew")
+        self.log.grid(row=9, column=0, sticky="nsew")
         self.log.tag_configure("success", foreground=self._GREEN)
         self.log.tag_configure("error", foreground=self._RED)
         self.log.tag_configure("muted", foreground=self._MUTED)
@@ -529,6 +606,9 @@ class AitoClipOperatorApp:
         self.current_stage.set(PipelineStage.RESOLVING_SOURCE.value)
         self.progress.set(0)
         self._output_directory = None
+        self._completed_run = None
+        self._upload_thread = None
+        self._pending_source = None
         self._requested_destinations = tuple(
             destination
             for destination, enabled in (
@@ -536,6 +616,9 @@ class AitoClipOperatorApp:
                 (FACEBOOK_DESTINATION, self.facebook_enabled.get()),
             )
             if enabled
+        )
+        self._requested_cleanup_policy = cleanup_policy_from_label(
+            self.cleanup_policy.get()
         )
         self.open_button.state(["disabled"])
         self._set_workflow_controls(active=True)
@@ -552,6 +635,40 @@ class AitoClipOperatorApp:
                 "Pipeline run accepted. No post-render uploads selected.",
                 "muted",
             )
+        if FACEBOOK_DESTINATION in self._requested_destinations:
+            self.current_stage.set(FACEBOOK_PREFLIGHT_STAGE)
+            self._pending_source = source
+            self._append_log(
+                "Validating the stored Facebook credential...",
+                "muted",
+            )
+            try:
+                self._facebook_preflight_controller.start(
+                    on_complete=lambda state: self._pipeline_events.put(
+                        ("facebook_preflight", state)
+                    ),
+                    on_failure=lambda state: self._pipeline_events.put(
+                        ("facebook_preflight", state)
+                    ),
+                )
+            except FacebookCredentialPreflightBusyError as exc:
+                self._pending_source = None
+                self._restore_idle_controls()
+                self.current_stage.set(PipelineStage.FAILED.value)
+                self._append_log(str(exc), "error")
+            except Exception as exc:
+                self._pending_source = None
+                self._restore_idle_controls()
+                self.current_stage.set(PipelineStage.FAILED.value)
+                self._append_log(
+                    "Could not start Facebook validation: "
+                    f"{type(exc).__name__}.",
+                    "error",
+                )
+            return
+        self._start_pipeline(source)
+
+    def _start_pipeline(self, source: ValidatedSource) -> None:
         try:
             self._controller.start(
                 source,
@@ -597,7 +714,31 @@ class AitoClipOperatorApp:
                 self._show_upload_summary(payload)
             elif event == "upload_failure" and isinstance(payload, str):
                 self._show_upload_failure(payload)
+            elif event == "cleanup_result" and isinstance(payload, CleanupResult):
+                self._show_cleanup_result(payload)
+            elif event == "cleanup_failure" and isinstance(payload, str):
+                self._show_cleanup_failure(payload)
+            elif event == "facebook_preflight" and isinstance(
+                payload, FacebookCredentialState
+            ):
+                self._show_facebook_preflight(payload)
         self.root.after(75, self._drain_pipeline_events)
+
+    def _show_facebook_preflight(
+        self,
+        state: FacebookCredentialState,
+    ) -> None:
+        self._set_facebook_credential_state(state)
+        source = self._pending_source
+        self._pending_source = None
+        if state is FacebookCredentialState.CONNECTED and source is not None:
+            self._append_log("Facebook credential validated.", "success")
+            self._start_pipeline(source)
+            return
+        self.current_stage.set(PipelineStage.FAILED.value)
+        self.progress.set(0)
+        self._append_log(_facebook_preflight_failure_message(state), "error")
+        self._restore_idle_controls()
 
     def _show_pipeline_stage(self, stage: PipelineStage) -> None:
         self.current_stage.set(stage.value)
@@ -610,6 +751,7 @@ class AitoClipOperatorApp:
         self._append_log(stage.value, "success")
 
     def _show_pipeline_success(self, result: PipelineRunSuccess) -> None:
+        self._completed_run = result
         self._output_directory = result.output_directory
         self.current_stage.set(PipelineStage.COMPLETED.value)
         self.progress.set(100)
@@ -621,7 +763,8 @@ class AitoClipOperatorApp:
         self.open_button.state(["!disabled"])
         if not self._requested_destinations:
             self._append_log("No upload was requested.", "muted")
-            self._restore_idle_controls()
+            self._workflow_terminal_stage = PipelineStage.COMPLETED.value
+            self._start_cleanup(result, None)
             return
         if not result.rendered_clips:
             self.current_stage.set("Completed with upload failures")
@@ -630,7 +773,8 @@ class AitoClipOperatorApp:
                 "were returned.",
                 "error",
             )
-            self._restore_idle_controls()
+            self._workflow_terminal_stage = "Completed with upload failures"
+            self._start_cleanup(result, None)
             return
         self.current_stage.set("Uploading")
         self.progress.set(0)
@@ -639,7 +783,7 @@ class AitoClipOperatorApp:
             "muted",
         )
         try:
-            self._upload_controller.start(
+            self._upload_thread = self._upload_controller.start(
                 result.rendered_clips,
                 self._requested_destinations,
                 on_event=lambda event: self._pipeline_events.put(
@@ -658,6 +802,7 @@ class AitoClipOperatorApp:
             self._show_upload_failure(type(exc).__name__)
 
     def _show_pipeline_failure(self, failure: PipelineRunFailure) -> None:
+        self._completed_run = None
         self.current_stage.set(PipelineStage.FAILED.value)
         self.progress.set(0)
         self._append_log(failure.message, "error")
@@ -688,32 +833,146 @@ class AitoClipOperatorApp:
     def _show_upload_summary(self, summary: UploadQueueSummary) -> None:
         self.progress.set(100)
         if summary.failed:
-            self.current_stage.set("Completed with upload failures")
+            self._workflow_terminal_stage = "Completed with upload failures"
+            self.current_stage.set(self._workflow_terminal_stage)
             self._append_log(
                 f"Upload summary: {summary.completed} completed, "
                 f"{summary.failed} failed.",
                 "error",
             )
         else:
-            self.current_stage.set(PipelineStage.COMPLETED.value)
+            self._workflow_terminal_stage = PipelineStage.COMPLETED.value
+            self.current_stage.set(self._workflow_terminal_stage)
             self._append_log(
                 f"Upload summary: {summary.completed} completed, 0 failed.",
                 "success",
             )
-        self._restore_idle_controls()
+        if self._completed_run is None:
+            self._restore_idle_controls()
+            return
+        self._start_cleanup_after_upload_exit(self._completed_run, summary)
 
     def _show_upload_failure(self, error_type: str) -> None:
-        self.current_stage.set("Completed with upload failures")
+        self._workflow_terminal_stage = "Completed with upload failures"
+        self.current_stage.set(self._workflow_terminal_stage)
         self.progress.set(100)
         self._append_log(
             f"Upload queue stopped unexpectedly ({error_type}).",
             "error",
         )
+        if self._completed_run is None:
+            self._restore_idle_controls()
+            return
+        self._start_cleanup_after_upload_exit(self._completed_run, None)
+
+    def _start_cleanup_after_upload_exit(
+        self,
+        result: PipelineRunSuccess,
+        upload_summary: UploadQueueSummary | None,
+    ) -> None:
+        upload_thread = self._upload_thread
+        if upload_thread is not None and upload_thread.is_alive():
+            self.root.after(
+                25,
+                self._start_cleanup_after_upload_exit,
+                result,
+                upload_summary,
+            )
+            return
+        if upload_thread is not None:
+            upload_thread.join(timeout=0)
+        self._upload_thread = None
+        self._start_cleanup(result, upload_summary)
+
+    def _start_cleanup(
+        self,
+        result: PipelineRunSuccess,
+        upload_summary: UploadQueueSummary | None,
+    ) -> None:
+        request = CleanupRequest(
+            run_directory=result.run_directory,
+            clips_directory=result.output_directory,
+            report_path=result.report_path,
+            expected_rendered_clip_count=result.rendered_clip_count,
+            rendered_clips=result.rendered_clips,
+            selected_destinations=self._requested_destinations,
+            upload_summary=upload_summary,
+            policy=self._requested_cleanup_policy,
+        )
+        try:
+            self._cleanup_controller.start(
+                request,
+                on_complete=lambda cleanup_result: self._pipeline_events.put(
+                    ("cleanup_result", cleanup_result)
+                ),
+                on_failure=lambda error_type: self._pipeline_events.put(
+                    ("cleanup_failure", error_type)
+                ),
+            )
+        except Exception as exc:
+            self._show_cleanup_failure(type(exc).__name__)
+
+    def _show_cleanup_result(self, result: CleanupResult) -> None:
+        self.current_stage.set(self._workflow_terminal_stage)
+        self.progress.set(100)
+        if result.cleanup_status in {
+            CleanupStatus.COMPLETED.value,
+            CleanupStatus.ALREADY_CLEAN.value,
+        }:
+            self._append_log("Cleaning up uploaded clips...", "muted")
+            megabytes = result.bytes_deleted / (1024 * 1024)
+            self._append_log(
+                f"Deleted {result.deleted_clip_count} rendered clips. "
+                f"Freed approximately {megabytes:.2f} MB.",
+                "success",
+            )
+        elif result.cleanup_status == CleanupStatus.RETAINED_BY_POLICY.value:
+            self._append_log("Rendered clips retained by cleanup policy.", "muted")
+        elif result.cleanup_status == CleanupStatus.RETAINED_NO_DESTINATIONS.value:
+            self._append_log(
+                "Rendered clips retained because no upload destination was selected.",
+                "muted",
+            )
+        else:
+            issue = (
+                result.sanitized_cleanup_errors[0].code
+                if result.sanitized_cleanup_errors
+                else result.cleanup_status
+            )
+            self._append_log(
+                f"Cleanup retained remaining rendered clips ({issue}).",
+                "error",
+            )
+        if any(
+            issue.stage == "record_report"
+            for issue in result.sanitized_cleanup_errors
+        ):
+            self._append_log(
+                "Cleanup result could not be recorded in the production report.",
+                "error",
+            )
+        self._completed_run = None
+        self._restore_idle_controls()
+
+    def _show_cleanup_failure(self, error_type: str) -> None:
+        self.current_stage.set(self._workflow_terminal_stage)
+        self.progress.set(100)
+        self._append_log(
+            f"Cleanup stopped unexpectedly ({error_type}); inspect the "
+            "production cleanup record before retrying.",
+            "error",
+        )
+        self._completed_run = None
         self._restore_idle_controls()
 
     @property
     def _workflow_is_running(self) -> bool:
-        return self._controller.is_running or self._upload_controller.is_running
+        return (
+            self._facebook_preflight_controller.is_running
+            or self._controller.is_running
+            or self._upload_controller.is_running
+            or self._cleanup_controller.is_running
+        )
 
     def _set_workflow_controls(self, *, active: bool) -> None:
         state = ["disabled"] if active else ["!disabled"]
@@ -722,6 +981,7 @@ class AitoClipOperatorApp:
         self.youtube_checkbox.state(state)
         self.facebook_checkbox.state(state)
         self.facebook_credential_button.state(state)
+        self.cleanup_policy_control.state(state)
 
     def replace_facebook_credential(self) -> None:
         """Validate and save a Page token without retaining or logging it."""
