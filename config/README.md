@@ -17,14 +17,18 @@ The client secrets, generated refresh token, and runtime ledger must never be
 committed.
 
 For Facebook Page uploads, copy `facebook-upload.example.json` to the ignored
-`facebook-upload.json`. Keep the Page access token out of that file and supply
-settings with:
+`facebook-upload.json`. Keep the Page access token out of that file. Non-secret
+settings can also be supplied with:
 
 - `AITOCLIP_FACEBOOK_PAGE_ID`
-- `AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN`
 - `AITOCLIP_FACEBOOK_GRAPH_API_VERSION`
 - `AITOCLIP_UPLOAD_LEDGER_PATH`
 
-Only Page access tokens are accepted operationally; personal-profile uploads
-are outside this adapter. The Page token and runtime ledger must never be
-committed.
+Use **Configure Facebook** in the operator interface to validate and store the
+Page token as the Windows Credential Manager generic credential
+`AitoClipAI/Facebook/Page/<PAGE_ID>`. Existing
+`AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN` values are no longer read; after a
+successful configuration, remove that variable from the PowerShell session
+and any local profile. Only Page access tokens are accepted operationally;
+personal-profile uploads are outside this adapter. The Page token and runtime
+ledger must never be committed.

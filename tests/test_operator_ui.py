@@ -6,6 +6,10 @@ import sys
 
 import pytest
 
+from facebook_auth_contracts import (
+    FacebookCredentialDiagnostic,
+    FacebookCredentialState,
+)
 import operator_ui
 from operator_pipeline import (
     PipelineRunFailure,
@@ -28,6 +32,7 @@ from operator_ui import (
     DemoDataError,
     load_validation06,
 )
+from uploading import FacebookAuthenticationRequired
 
 
 def test_demo_loads_validation06_without_network_or_writes(monkeypatch) -> None:
@@ -146,6 +151,27 @@ class _FakeUploadController:
         self.starts.append((tuple(clips), tuple(destinations), callbacks))
 
 
+class _FakeFacebookCredentials:
+    def __init__(
+        self,
+        state=FacebookCredentialState.NOT_CONFIGURED,
+        failure=None,
+    ) -> None:
+        self.state = state
+        self.failure = failure
+        self.replacements = []
+
+    def current_state(self):
+        return self.state
+
+    def replace(self, token):
+        self.replacements.append(token)
+        if self.failure is not None:
+            raise self.failure
+        self.state = FacebookCredentialState.CONNECTED
+        return self.state
+
+
 def _terminal_state_app():
     app = operator_ui.AitoClipOperatorApp.__new__(
         operator_ui.AitoClipOperatorApp
@@ -157,6 +183,11 @@ def _terminal_state_app():
     app.demo_button = _FakeButton()
     app.youtube_checkbox = _FakeButton()
     app.facebook_checkbox = _FakeButton()
+    app.facebook_credential_button = _FakeButton()
+    app.facebook_credential_state = _FakeVariable()
+    app.facebook_credential_action = _FakeVariable()
+    app._facebook_credentials = _FakeFacebookCredentials()
+    app._controller = _FakeUploadController()
     app._upload_controller = _FakeUploadController()
     app._requested_destinations = ()
     app._pipeline_events = operator_ui.queue.SimpleQueue()
@@ -180,6 +211,123 @@ def test_workflow_disables_and_reenables_upload_checkboxes() -> None:
         ("disabled",),
         ("!disabled",),
     ]
+    assert app.facebook_credential_button.states == [
+        ("disabled",),
+        ("!disabled",),
+    ]
+
+
+def test_facebook_credential_dialog_is_masked_and_saves_after_validation(
+    monkeypatch,
+) -> None:
+    app, messages = _terminal_state_app()
+    app.root = object()
+    prompts = []
+
+    def fake_askstring(title, prompt, **kwargs):
+        prompts.append((title, prompt, kwargs))
+        return "secret-page-token"
+
+    monkeypatch.setattr(operator_ui.simpledialog, "askstring", fake_askstring)
+
+    app.replace_facebook_credential()
+
+    assert app._facebook_credentials.replacements == ["secret-page-token"]
+    assert prompts[0][2]["show"] == "*"
+    assert prompts[0][2]["parent"] is app.root
+    assert app.facebook_credential_state.value == "Facebook Connected"
+    assert (
+        app.facebook_credential_action.value
+        == "Replace Facebook Credential"
+    )
+    assert all("secret-page-token" not in message for message, _ in messages)
+
+
+def test_invalid_facebook_credential_updates_safe_state_without_leakage(
+    monkeypatch,
+) -> None:
+    app, messages = _terminal_state_app()
+    app.root = object()
+    app._facebook_credentials = _FakeFacebookCredentials(
+        failure=FacebookAuthenticationRequired(
+            FacebookCredentialState.WRONG_PAGE
+        )
+    )
+    monkeypatch.setattr(
+        operator_ui.simpledialog,
+        "askstring",
+        lambda *args, **kwargs: "wrong-page-secret",
+    )
+
+    app.replace_facebook_credential()
+
+    assert app.facebook_credential_state.value == "Facebook Wrong Page"
+    assert all("wrong-page-secret" not in message for message, _ in messages)
+
+
+def test_facebook_configuration_failure_shows_only_sanitized_stage(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    app, messages = _terminal_state_app()
+    app.root = object()
+    diagnostic_path = tmp_path / "facebook-diagnostic.json"
+    app._facebook_credentials = _FakeFacebookCredentials(
+        failure=FacebookAuthenticationRequired(
+            FacebookCredentialState.UNAVAILABLE,
+            diagnostic=FacebookCredentialDiagnostic(
+                stage="graph_validation",
+                http_status=400,
+                graph_error_code=100,
+                graph_error_type="OAuthException",
+                graph_error_message="Detailed server message",
+            ),
+            diagnostic_log_path=diagnostic_path,
+        )
+    )
+    monkeypatch.setattr(
+        operator_ui.simpledialog,
+        "askstring",
+        lambda *args, **kwargs: "secret-page-token",
+    )
+
+    app.replace_facebook_credential()
+
+    assert (
+        "Facebook Unavailable during graph validation.",
+        "error",
+    ) in messages
+    assert (
+        f"Sanitized diagnostic: {diagnostic_path}",
+        "muted",
+    ) in messages
+    rendered_messages = "\n".join(message for message, _ in messages)
+    assert "secret-page-token" not in rendered_messages
+    assert "Detailed server message" not in rendered_messages
+
+
+def test_upload_auth_event_updates_facebook_reauthorization_state() -> None:
+    app, messages = _terminal_state_app()
+    event = UploadQueueEvent(
+        UploadEventKind.FAILED,
+        "facebook",
+        1,
+        2,
+        error_type="FacebookAuthenticationRequired",
+        authentication_state=FacebookCredentialState.REAUTHORIZATION_REQUIRED,
+    )
+
+    app._show_upload_event(event)
+
+    assert (
+        app.facebook_credential_state.value
+        == "Facebook Reauthorization Required"
+    )
+    assert (
+        app.facebook_credential_action.value
+        == "Replace Facebook Credential"
+    )
+    assert ("Facebook uploads stopped: Facebook Reauthorization Required.", "error") in messages
 
 
 def test_successful_pipeline_completion_updates_ui_state(tmp_path: Path) -> None:

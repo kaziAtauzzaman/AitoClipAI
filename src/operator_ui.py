@@ -11,9 +11,17 @@ import queue
 import subprocess
 import sys
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import scrolledtext, simpledialog, ttk
 from typing import Sequence
 
+from facebook_auth_contracts import (
+    FacebookAuthenticationIssue,
+    FacebookCredentialState,
+)
+from operator_facebook_auth import (
+    OperatorFacebookCredentialManager,
+    ProductionFacebookCredentialManager,
+)
 from operator_pipeline import (
     OperatorPipelineController,
     PipelineRunFailure,
@@ -180,6 +188,18 @@ def _required_count(values: dict[str, object], key: str) -> int:
     return value
 
 
+def _facebook_credential_action(state: FacebookCredentialState) -> str:
+    return (
+        "Configure Facebook"
+        if state is FacebookCredentialState.NOT_CONFIGURED
+        else "Replace Facebook Credential"
+    )
+
+
+def _facebook_diagnostic_stage_label(stage: str) -> str:
+    return stage.replace("_", " ")
+
+
 class AitoClipOperatorApp:
     """Dark Tkinter interface for production processing and cached proof."""
 
@@ -197,6 +217,7 @@ class AitoClipOperatorApp:
         root: tk.Tk,
         controller: OperatorPipelineController | None = None,
         upload_controller: OperatorUploadController | None = None,
+        facebook_credentials: OperatorFacebookCredentialManager | None = None,
     ) -> None:
         self.root = root
         self.root.title("AitoClipAI — Operator")
@@ -206,12 +227,22 @@ class AitoClipOperatorApp:
 
         self._controller = controller or OperatorPipelineController()
         self._upload_controller = upload_controller or OperatorUploadController()
+        self._facebook_credentials = (
+            facebook_credentials or ProductionFacebookCredentialManager()
+        )
         self._pipeline_events: queue.SimpleQueue[tuple[str, object]] = (
             queue.SimpleQueue()
         )
         self.source = tk.StringVar()
         self.youtube_enabled = tk.BooleanVar(value=False)
         self.facebook_enabled = tk.BooleanVar(value=False)
+        initial_facebook_state = self._facebook_credentials.current_state()
+        self.facebook_credential_state = tk.StringVar(
+            value=initial_facebook_state.label
+        )
+        self.facebook_credential_action = tk.StringVar(
+            value=_facebook_credential_action(initial_facebook_state)
+        )
         self.current_stage = tk.StringVar(value="Ready")
         self.progress = tk.DoubleVar(value=0.0)
         self._metric_values: dict[str, tk.StringVar] = {}
@@ -321,7 +352,7 @@ class AitoClipOperatorApp:
         workspace = ttk.Frame(body, style="Panel.TFrame", padding=18)
         workspace.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         workspace.columnconfigure(0, weight=1)
-        workspace.rowconfigure(7, weight=1)
+        workspace.rowconfigure(8, weight=1)
 
         ttk.Label(workspace, text="SOURCE", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
@@ -370,8 +401,23 @@ class AitoClipOperatorApp:
             style="Body.TLabel",
         ).pack(side="left")
 
+        facebook_auth = ttk.Frame(workspace, style="Panel.TFrame")
+        facebook_auth.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        ttk.Label(
+            facebook_auth,
+            textvariable=self.facebook_credential_state,
+            style="Body.TLabel",
+        ).pack(side="left")
+        self.facebook_credential_button = ttk.Button(
+            facebook_auth,
+            textvariable=self.facebook_credential_action,
+            command=self.replace_facebook_credential,
+            style="Secondary.TButton",
+        )
+        self.facebook_credential_button.pack(side="right")
+
         controls = ttk.Frame(workspace, style="Panel.TFrame")
-        controls.grid(row=4, column=0, sticky="ew", pady=(0, 18))
+        controls.grid(row=5, column=0, sticky="ew", pady=(0, 18))
         self.start_button = ttk.Button(
             controls,
             text=START_BUTTON_LABEL,
@@ -396,7 +442,7 @@ class AitoClipOperatorApp:
         self.open_button.pack(side="left")
 
         status_row = ttk.Frame(workspace, style="Panel.TFrame")
-        status_row.grid(row=5, column=0, sticky="ew", pady=(0, 7))
+        status_row.grid(row=6, column=0, sticky="ew", pady=(0, 7))
         ttk.Label(status_row, text="CURRENT STAGE", style="Section.TLabel").pack(
             side="left"
         )
@@ -410,7 +456,7 @@ class AitoClipOperatorApp:
             variable=self.progress,
             maximum=100,
             style="Demo.Horizontal.TProgressbar",
-        ).grid(row=6, column=0, sticky="ew", pady=(0, 10))
+        ).grid(row=7, column=0, sticky="ew", pady=(0, 10))
 
         self.log = scrolledtext.ScrolledText(
             workspace,
@@ -426,7 +472,7 @@ class AitoClipOperatorApp:
             pady=10,
             state="disabled",
         )
-        self.log.grid(row=7, column=0, sticky="nsew")
+        self.log.grid(row=8, column=0, sticky="nsew")
         self.log.tag_configure("success", foreground=self._GREEN)
         self.log.tag_configure("error", foreground=self._RED)
         self.log.tag_configure("muted", foreground=self._MUTED)
@@ -626,6 +672,15 @@ class AitoClipOperatorApp:
         self._set_workflow_controls(active=False)
 
     def _show_upload_event(self, event: UploadQueueEvent) -> None:
+        if event.authentication_state is not None:
+            self._set_facebook_credential_state(event.authentication_state)
+        elif (
+            event.destination == FACEBOOK_DESTINATION
+            and event.kind.value == "completed"
+        ):
+            self._set_facebook_credential_state(
+                FacebookCredentialState.CONNECTED
+            )
         self.current_stage.set(f"Uploading to {event.platform_label}")
         tag = "error" if event.kind.value == "failed" else "success"
         self._append_log(event.message, tag)
@@ -666,6 +721,61 @@ class AitoClipOperatorApp:
         self.demo_button.state(state)
         self.youtube_checkbox.state(state)
         self.facebook_checkbox.state(state)
+        self.facebook_credential_button.state(state)
+
+    def replace_facebook_credential(self) -> None:
+        """Validate and save a Page token without retaining or logging it."""
+
+        if self._workflow_is_running:
+            self._append_log(
+                "Facebook credentials cannot change during an active workflow.",
+                "error",
+            )
+            return
+        token = simpledialog.askstring(
+            "Facebook Page credential",
+            "Paste the Facebook Page access token:",
+            show="*",
+            parent=self.root,
+        )
+        if token is None:
+            return
+        try:
+            state = self._facebook_credentials.replace(token)
+        except FacebookAuthenticationIssue as exc:
+            self._set_facebook_credential_state(exc.state)
+            diagnostic = getattr(exc, "diagnostic", None)
+            if diagnostic is None:
+                self._append_log(exc.state.label, "error")
+            else:
+                self._append_log(
+                    f"{exc.state.label} during "
+                    f"{_facebook_diagnostic_stage_label(diagnostic.stage)}.",
+                    "error",
+                )
+            diagnostic_path = getattr(exc, "diagnostic_log_path", None)
+            if diagnostic_path is not None:
+                self._append_log(
+                    f"Sanitized diagnostic: {diagnostic_path}",
+                    "muted",
+                )
+            return
+        except Exception:
+            state = FacebookCredentialState.UNAVAILABLE
+            self._set_facebook_credential_state(state)
+            self._append_log(state.label, "error")
+            return
+        self._set_facebook_credential_state(state)
+        self._append_log("Facebook credential validated and saved.", "success")
+
+    def _set_facebook_credential_state(
+        self,
+        state: FacebookCredentialState,
+    ) -> None:
+        self.facebook_credential_state.set(state.label)
+        self.facebook_credential_action.set(
+            _facebook_credential_action(state)
+        )
 
     def run_demo(self) -> None:
         """Load cached proof and present a short local-only stage sequence."""

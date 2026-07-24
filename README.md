@@ -57,10 +57,13 @@ python -m uploading.facebook_cli --clip PATH_TO_CLIP \
 ```
 
 The adapter supports Facebook Pages only. `published` creates an immediately
-published Page video; `unpublished` uploads it without publishing. A real
-upload requires a Page access token in
-`AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN`. The Meta app/user grant must include
-`pages_show_list`, `pages_read_engagement`, and `pages_manage_posts`.
+published Page video; `unpublished` uploads it without publishing. Configure
+the Page token once from the operator interface; AitoClipAI validates the
+configured Page and publishing capability before saving the token as a Windows
+Credential Manager generic credential. Tokens are never stored in JSON,
+upload ledgers, reports, or environment variables. The Meta app/user grant
+must include `pages_show_list`, `pages_read_engagement`, and
+`pages_manage_posts`.
 
 Run the complete automated suite:
 

@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 
 from core import UploadJob, UploadStatus
+from facebook_auth_contracts import FacebookCredentialState
 from uploading import (
+    FacebookAuthenticationRequired,
     FacebookClientError,
     FacebookGraphClient,
     FacebookRemoteVideo,
@@ -267,6 +269,41 @@ def test_facebook_retryable_failure_resumes_same_identity(tmp_path: Path) -> Non
     assert client.upload_calls == 1
 
 
+def test_facebook_authorization_failure_keeps_identity_retryable(
+    tmp_path: Path,
+) -> None:
+    secret = "sensitive-token-value"
+    client = FakeFacebookClient()
+    client.find_error = FacebookClientError(
+        f"expired credential {secret}",
+        retryable=False,
+        graph_code=190,
+    )
+    uploader = facebook_service(tmp_path, client)
+    job = facebook_job(tmp_path)
+    identity = stable_upload_identity(job)
+
+    with pytest.raises(FacebookAuthenticationRequired) as captured:
+        uploader.execute(job)
+
+    assert (
+        captured.value.state
+        is FacebookCredentialState.REAUTHORIZATION_REQUIRED
+    )
+    ledger_path = tmp_path / "uploads" / "ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["uploads"][identity]["state"] == "pending"
+    assert ledger["uploads"][identity]["retryable"] is True
+    assert secret not in ledger_path.read_text(encoding="utf-8")
+
+    client.find_error = None
+    result = uploader.execute(job)
+
+    assert result.upload_identity == identity
+    assert client.find_calls == 2
+    assert client.upload_calls == 1
+
+
 def test_facebook_client_page_must_match_job_page(tmp_path: Path) -> None:
     client = FakeFacebookClient(page_id="999999999")
 
@@ -390,7 +427,7 @@ def test_facebook_graph_errors_preserve_retry_classification(
     assert captured.value.retryable is retryable
 
 
-def test_facebook_config_uses_environment_token_and_file_settings(
+def test_facebook_config_binds_resolved_token_to_file_settings(
     tmp_path: Path,
 ) -> None:
     config_dir = tmp_path / "config"
@@ -410,6 +447,7 @@ def test_facebook_config_uses_environment_token_and_file_settings(
     config = FacebookUploadConfig.from_sources(
         config_path=path,
         environ={"AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN": "page-token"},
+        page_access_token="page-token",
     )
 
     assert config.page_id == PAGE_ID

@@ -7,8 +7,13 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from core import UploadJob, UploadResult, UploadStatus
+from facebook_auth_contracts import FacebookCredentialState
 from uploading.contracts import UploadPlan
-from uploading.errors import PermanentUploadError, RetryableUploadError
+from uploading.errors import (
+    FacebookAuthenticationRequired,
+    PermanentUploadError,
+    RetryableUploadError,
+)
 from uploading.facebook_config import FacebookUploadConfig
 from uploading.identity import normalize_destination
 
@@ -17,6 +22,8 @@ FACEBOOK_DESTINATION = "facebook"
 FACEBOOK_VIDEO_URL = "https://www.facebook.com/{page_id}/videos/{video_id}/"
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _RETRYABLE_GRAPH_CODES = frozenset({1, 2, 4, 17, 32, 613})
+_AUTHENTICATION_GRAPH_CODES = frozenset({102, 190})
+_PERMISSION_GRAPH_CODES = frozenset({10, 200, 299})
 _RECOVERY_PAGE_SIZE = 25
 _PUBLISHING_STATES = {
     "public": ("published", True),
@@ -38,9 +45,18 @@ class FacebookRemoteVideo:
 class FacebookClientError(Exception):
     """Client-level Graph API failure translated by the adapter."""
 
-    def __init__(self, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        graph_code: int | None = None,
+        http_status: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.graph_code = graph_code
+        self.http_status = http_status
 
 
 class FacebookClient(Protocol):
@@ -263,12 +279,12 @@ class FacebookGraphClient:
             return getattr(self._session, method)(url, **kwargs)
         except self._retryable_transport_errors as exc:
             raise FacebookClientError(
-                f"Facebook API transport failed: {exc}",
+                "Facebook API transport failed.",
                 retryable=True,
             ) from exc
         except self._permanent_transport_errors as exc:
             raise FacebookClientError(
-                f"Facebook API request could not be constructed: {exc}",
+                "Facebook API request could not be constructed.",
                 retryable=False,
             ) from exc
 
@@ -365,11 +381,14 @@ def _response_payload(response: Any) -> dict[str, Any]:
         raise FacebookClientError(
             str(message) if message else "Facebook Graph API rejected the request.",
             retryable=retryable,
+            graph_code=code if isinstance(code, int) else None,
+            http_status=status if isinstance(status, int) else None,
         )
     if isinstance(status, int) and status >= 400:
         raise FacebookClientError(
             f"Facebook API request failed with HTTP {status}.",
             retryable=status in _RETRYABLE_HTTP_STATUSES,
+            http_status=status,
         )
     return payload
 
@@ -406,5 +425,19 @@ def _optional_string(value: object) -> str | None:
 
 
 def _classified_error(error: FacebookClientError):
+    if (
+        error.graph_code in _AUTHENTICATION_GRAPH_CODES
+        or error.http_status == 401
+    ):
+        return FacebookAuthenticationRequired(
+            FacebookCredentialState.REAUTHORIZATION_REQUIRED
+        )
+    if (
+        error.graph_code in _PERMISSION_GRAPH_CODES
+        or error.http_status == 403
+    ):
+        return FacebookAuthenticationRequired(
+            FacebookCredentialState.PERMISSION_ERROR
+        )
     error_type = RetryableUploadError if error.retryable else PermanentUploadError
     return error_type(str(error))

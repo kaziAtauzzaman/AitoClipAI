@@ -1,4 +1,4 @@
-"""Environment and file configuration for Facebook Page uploads."""
+"""Non-secret configuration for Facebook Page uploads."""
 
 from dataclasses import dataclass, field
 import json
@@ -12,18 +12,16 @@ from uploading.errors import PermanentUploadError
 
 DEFAULT_FACEBOOK_GRAPH_API_VERSION = "v25.0"
 FACEBOOK_PAGE_ID_ENV = "AITOCLIP_FACEBOOK_PAGE_ID"
-FACEBOOK_PAGE_ACCESS_TOKEN_ENV = "AITOCLIP_FACEBOOK_PAGE_ACCESS_TOKEN"
 FACEBOOK_GRAPH_API_VERSION_ENV = "AITOCLIP_FACEBOOK_GRAPH_API_VERSION"
 UPLOAD_LEDGER_ENV = "AITOCLIP_UPLOAD_LEDGER_PATH"
 _GRAPH_VERSION_PATTERN = re.compile(r"v[1-9][0-9]*\.0\Z")
 
 
 @dataclass(frozen=True, slots=True)
-class FacebookUploadConfig:
-    """One Facebook Page target and its environment-supplied credential."""
+class FacebookUploadSettings:
+    """One Facebook Page target containing no credential material."""
 
     page_id: str
-    page_access_token: str = field(repr=False)
     graph_api_version: str = DEFAULT_FACEBOOK_GRAPH_API_VERSION
     ledger_path: Path = Path("data") / "uploads" / "upload-ledger.json"
 
@@ -33,8 +31,8 @@ class FacebookUploadConfig:
         *,
         config_path: Path | None = None,
         environ: Mapping[str, str] | None = None,
-    ) -> "FacebookUploadConfig":
-        """Load non-secret settings from JSON and the Page token from env."""
+    ) -> "FacebookUploadSettings":
+        """Load Page identity and paths without reading any token source."""
 
         values: dict[str, object] = {}
         base = Path.cwd()
@@ -55,7 +53,6 @@ class FacebookUploadConfig:
 
         environment = dict(os.environ if environ is None else environ)
         page_id = environment.get(FACEBOOK_PAGE_ID_ENV) or values.get("page_id")
-        token = environment.get(FACEBOOK_PAGE_ACCESS_TOKEN_ENV)
         version = environment.get(FACEBOOK_GRAPH_API_VERSION_ENV) or values.get(
             "graph_api_version", DEFAULT_FACEBOOK_GRAPH_API_VERSION
         )
@@ -67,11 +64,6 @@ class FacebookUploadConfig:
                 f"Facebook Page ID is required via {FACEBOOK_PAGE_ID_ENV} "
                 "or page_id in the config file."
             )
-        if not isinstance(token, str) or not token.strip():
-            raise PermanentUploadError(
-                "A Facebook Page access token is required via "
-                f"{FACEBOOK_PAGE_ACCESS_TOKEN_ENV}."
-            )
         if not isinstance(version, str) or not version.strip():
             raise PermanentUploadError("Facebook Graph API version must be a string.")
         if not isinstance(ledger, str) or not ledger.strip():
@@ -79,24 +71,69 @@ class FacebookUploadConfig:
 
         config = cls(
             page_id=page_id.strip(),
-            page_access_token=token.strip(),
             graph_api_version=version.strip(),
             ledger_path=_configured_path(ledger, base),
         )
-        config.validate_for_upload()
+        config.validate()
         return config
 
-    def validate_for_upload(self) -> None:
-        """Reject malformed Page targets before constructing an API client."""
-
+    def validate(self) -> None:
+        """Reject malformed non-secret Page settings."""
         if not self.page_id.isdigit():
             raise PermanentUploadError("Facebook Page ID must contain only digits.")
-        if not self.page_access_token.strip():
-            raise PermanentUploadError("Facebook Page access token must not be empty.")
         if _GRAPH_VERSION_PATTERN.fullmatch(self.graph_api_version) is None:
             raise PermanentUploadError(
                 "Facebook Graph API version must use the form v25.0."
             )
+
+    def with_page_access_token(self, token: str) -> "FacebookUploadConfig":
+        """Bind a validated secret at the final Graph-client boundary."""
+
+        config = FacebookUploadConfig(
+            page_id=self.page_id,
+            page_access_token=token,
+            graph_api_version=self.graph_api_version,
+            ledger_path=self.ledger_path,
+        )
+        config.validate_for_upload()
+        return config
+
+
+@dataclass(frozen=True, slots=True)
+class FacebookUploadConfig:
+    """One validated Facebook Page target and its in-memory credential."""
+
+    page_id: str
+    page_access_token: str = field(repr=False)
+    graph_api_version: str = DEFAULT_FACEBOOK_GRAPH_API_VERSION
+    ledger_path: Path = Path("data") / "uploads" / "upload-ledger.json"
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        page_access_token: str,
+        config_path: Path | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> "FacebookUploadConfig":
+        """Bind an explicitly resolved token to non-secret settings."""
+
+        settings = FacebookUploadSettings.from_sources(
+            config_path=config_path,
+            environ=environ,
+        )
+        return settings.with_page_access_token(page_access_token)
+
+    def validate_for_upload(self) -> None:
+        """Reject malformed Page targets before constructing an API client."""
+
+        FacebookUploadSettings(
+            page_id=self.page_id,
+            graph_api_version=self.graph_api_version,
+            ledger_path=self.ledger_path,
+        ).validate()
+        if not self.page_access_token.strip():
+            raise PermanentUploadError("Facebook Page access token must not be empty.")
 
 
 def _configured_path(value: str, base: Path) -> Path:

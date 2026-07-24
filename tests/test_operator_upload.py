@@ -1,17 +1,22 @@
+import json
 from pathlib import Path
 import socket
 import threading
 
 from core import UploadResult, UploadStatus
+from facebook_auth_contracts import FacebookCredentialState
 from operator_pipeline import RenderedClipOutput
 from operator_upload import (
     FACEBOOK_DESTINATION,
     YOUTUBE_DESTINATION,
     OperatorUploadController,
     OperatorUploadQueue,
+    ProductionUploadRuntimeFactory,
     UploadEventKind,
     UploadRuntime,
 )
+from uploading import FacebookAuthenticationRequired
+from uploading import FacebookGraphClient
 
 
 class _FakeUploadService:
@@ -210,6 +215,131 @@ def test_platform_setup_failure_does_not_block_other_destination(
     assert summary.completed == 2
     assert summary.failed == 2
     assert len(facebook.calls) == 2
+
+
+def test_facebook_preflight_auth_failure_stops_facebook_after_youtube(
+    tmp_path: Path,
+) -> None:
+    youtube = _FakeUploadService()
+
+    class AuthenticationFactory:
+        def __call__(self, destination):
+            if destination == YOUTUBE_DESTINATION:
+                return UploadRuntime(youtube, "private")
+            raise FacebookAuthenticationRequired(
+                FacebookCredentialState.REAUTHORIZATION_REQUIRED
+            )
+
+    events = []
+    summary = OperatorUploadQueue(AuthenticationFactory()).run(
+        _rendered_clips(tmp_path),
+        (YOUTUBE_DESTINATION, FACEBOOK_DESTINATION),
+        on_event=events.append,
+    )
+
+    assert len(youtube.calls) == 2
+    assert summary.total == 4
+    assert summary.completed == 2
+    assert summary.failed == 2
+    auth_events = [
+        event for event in events if event.authentication_state is not None
+    ]
+    assert len(auth_events) == 1
+    assert (
+        auth_events[0].authentication_state
+        is FacebookCredentialState.REAUTHORIZATION_REQUIRED
+    )
+    assert "stopped" in auth_events[0].message
+
+
+def test_mid_queue_facebook_auth_failure_stops_remaining_clips(
+    tmp_path: Path,
+) -> None:
+    class ExpiredFacebookService:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def execute(self, job, *, dry_run=False):
+            self.calls.append(job)
+            raise FacebookAuthenticationRequired(
+                FacebookCredentialState.REAUTHORIZATION_REQUIRED
+            )
+
+    service = ExpiredFacebookService()
+    factory = _FakeRuntimeFactory({FACEBOOK_DESTINATION: service})
+    events = []
+
+    summary = OperatorUploadQueue(factory).run(
+        _rendered_clips(tmp_path, count=3),
+        (FACEBOOK_DESTINATION,),
+        on_event=events.append,
+    )
+
+    assert len(service.calls) == 1
+    assert summary.total == 3
+    assert summary.completed == 0
+    assert summary.failed == 3
+    assert [event.kind for event in events] == [
+        UploadEventKind.STARTED,
+        UploadEventKind.FAILED,
+    ]
+    assert (
+        events[-1].authentication_state
+        is FacebookCredentialState.REAUTHORIZATION_REQUIRED
+    )
+
+
+def test_production_facebook_runtime_resolves_credential_before_jobs(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "facebook-upload.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "page_id": "123456",
+                "graph_api_version": "v25.0",
+                "ledger_path": "ledger.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    order = []
+
+    class Resolver:
+        def resolve(self):
+            order.append("resolve")
+            return "validated-token"
+
+    def resolver_factory(settings):
+        order.append(("settings", settings.page_id))
+        return Resolver()
+
+    class Client:
+        page_id = "123456"
+
+    def client_from_config(config):
+        order.append(("client", config.page_access_token))
+        return Client()
+
+    monkeypatch.setattr(
+        FacebookGraphClient,
+        "from_config",
+        client_from_config,
+    )
+    factory = ProductionUploadRuntimeFactory(
+        facebook_config_path=config_path,
+        facebook_credential_resolver_factory=resolver_factory,
+    )
+
+    runtime = factory(FACEBOOK_DESTINATION)
+
+    assert order == [
+        ("settings", "123456"),
+        "resolve",
+        ("client", "validated-token"),
+    ]
+    assert runtime.facebook_page_id == "123456"
 
 
 def test_upload_controller_runs_queue_off_the_calling_thread(
